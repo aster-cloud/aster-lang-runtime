@@ -85,14 +85,10 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
     }
 
     /**
-     * 获取确定性上下文（Phase 0 Task 1.5）
-     *
-     * 注意：此方法已废弃，返回当前线程的 context 实例（ThreadLocal 隔离）。
-     * 建议使用 getDeterminismContext(workflowId) 获取特定 workflow 的 context。
+     * 获取当前线程的确定性上下文（ThreadLocal 隔离）
      *
      * @return 当前线程的确定性上下文实例
      */
-    @Deprecated
     public DeterminismContext getDeterminismContext() {
         return threadLocalContext.get();
     }
@@ -105,21 +101,6 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      */
     public DeterminismContext getDeterminismContext(String workflowId) {
         return contexts.computeIfAbsent(workflowId, k -> new DeterminismContext());
-    }
-
-    /**
-     * 兼容旧接口：返回 DeterminismContext 内部的时钟
-     *
-     * 注意：此方法已废弃。由于每个 workflow 现在有独立的 DeterminismContext，
-     * 此方法返回当前线程 context 的时钟实例（ThreadLocal 隔离）。
-     * 建议使用 getDeterminismContext(workflowId).clock() 获取特定 workflow 的时钟。
-     *
-     * @return 当前线程 context 的时钟实例
-     */
-    @Deprecated
-    @Override
-    public DeterministicClock getClock() {
-        return threadLocalContext.get().clock();
     }
 
     /**

@@ -24,16 +24,6 @@ public interface WorkflowRuntime {
     ExecutionHandle schedule(String workflowId, String idempotencyKey, WorkflowMetadata metadata);
 
     /**
-     * 获取确定性时钟实例
-     *
-     * 确定性时钟在初始执行时返回真实时间并记录，在重放模式下返回记录的时间，
-     * 确保 workflow 在重放时具有确定性行为。
-     *
-     * @return 确定性时钟实例
-     */
-    DeterministicClock getClock();
-
-    /**
      * 获取事件存储实例
      *
      * 事件存储用于持久化 workflow 执行事件，支持事件溯源和状态恢复。
