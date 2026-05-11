@@ -1,5 +1,7 @@
 # aster-lang-runtime -- Aster 运行时支持库
 
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 提供 Aster 语言的运行时基础设施，包括 GraalVM Native Image 兼容性替换、标准库原语、Result 类型和工作流引擎。
 
 ## 核心模块
