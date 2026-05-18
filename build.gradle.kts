@@ -39,7 +39,8 @@ java {
 repositories { mavenCentral() }
 
 dependencies {
-  implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.30.2"))
+  // R21-Major-5：与 aster-api 对齐到 3.32.2，避免运行时库 BOM 漂移
+  implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.32.2"))
   implementation("io.quarkus:quarkus-cache")
   implementation("io.quarkus:quarkus-core")
   implementation("io.smallrye.common:smallrye-common-net") // For CidrAddress (GraalVM substitutions)
