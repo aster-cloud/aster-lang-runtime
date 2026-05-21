@@ -46,6 +46,14 @@ dependencies {
   implementation("io.smallrye.common:smallrye-common-net") // For CidrAddress (GraalVM substitutions)
   implementation("jakarta.enterprise:jakarta.enterprise.cdi-api:4.0.1")
   implementation("jakarta.inject:jakarta.inject-api:2.0.1")
+
+  // 测试：保持与 core/truffle/validation 同版本（6.0.0），避免 BOM 漂移
+  testImplementation("org.junit.jupiter:junit-jupiter:6.0.0")
+  testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.13.4")
+}
+
+tasks.test {
+  useJUnitPlatform()
 }
 
 tasks.withType<Jar> {
