@@ -34,7 +34,13 @@ public final class VerifyClasses {
   }
 
   private static void collect(File root, File d, List<String> out) {
-    for (File f : d.listFiles()) {
+    File[] entries = d.listFiles();
+    if (entries == null) {
+      // I/O 错误或权限拒绝；按 java.io.File 契约可能返回 null。继续遍历兄弟目录而不是 NPE。
+      System.err.println("Warning: cannot list directory: " + d);
+      return;
+    }
+    for (File f : entries) {
       if (f.isDirectory()) collect(root, f, out);
       else if (f.getName().endsWith(".class")) {
         String rel = f.getAbsolutePath().substring(root.getAbsolutePath().length()+1);
