@@ -1,7 +1,5 @@
 package aster.runtime;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -17,14 +15,13 @@ public final class StdResult {
   public static Object mapOk(Object result, Object fn) {
     Fn1<Object, Object> mapper = (Fn1<Object, Object>) Objects.requireNonNull(fn, "fn");
 
-    if (isErrObject(result) || isErrMap(result)) {
+    if (result instanceof Err<?, ?> || isErrMap(result)) {
       return result;
     }
 
-    if (isOkObject(result)) {
-      Object okValue = readField(result, "value");
-      Object mapped = mapper.apply(okValue);
-      return rebuildVariant(result, mapped, /*isOk=*/true);
+    if (result instanceof Ok<?, ?> ok) {
+      Object mapped = mapper.apply(ok.value);
+      return new Ok<>(mapped);
     }
 
     if (result instanceof Map<?, ?> m && "Ok".equals(m.get("_type"))) {
@@ -43,14 +40,13 @@ public final class StdResult {
   public static Object mapErr(Object result, Object fn) {
     Fn1<Object, Object> mapper = (Fn1<Object, Object>) Objects.requireNonNull(fn, "fn");
 
-    if (isOkObject(result) || isOkMap(result)) {
+    if (result instanceof Ok<?, ?> || isOkMap(result)) {
       return result;
     }
 
-    if (isErrObject(result)) {
-      Object errValue = readField(result, "value", "error");
-      Object mapped = mapper.apply(errValue);
-      return rebuildVariant(result, mapped, /*isOk=*/false);
+    if (result instanceof Err<?, ?> err) {
+      Object mapped = mapper.apply(err.error);
+      return new Err<>(mapped);
     }
 
     if (result instanceof Map<?, ?> m && "Err".equals(m.get("_type"))) {
@@ -90,8 +86,8 @@ public final class StdResult {
 
   /** 解包 Ok 值。*/
   public static Object unwrap(Object result) {
-    if (isOkObject(result)) {
-      return readField(result, "value", "value", "val");
+    if (result instanceof Ok<?, ?> ok) {
+      return ok.value;
     }
     if (isOkMap(result)) {
       return readMapPayload((Map<?, ?>) result);
@@ -101,21 +97,13 @@ public final class StdResult {
 
   /** 解包 Err 值。*/
   public static Object unwrapErr(Object result) {
-    if (isErrObject(result)) {
-      return readField(result, "value", "error");
+    if (result instanceof Err<?, ?> err) {
+      return err.error;
     }
     if (isErrMap(result)) {
       return readMapPayload((Map<?, ?>) result);
     }
     throw new RuntimeException("Result.unwrapErr: called on Ok");
-  }
-
-  private static boolean isOkObject(Object value) {
-    return value != null && "Ok".equals(value.getClass().getSimpleName());
-  }
-
-  private static boolean isErrObject(Object value) {
-    return value != null && "Err".equals(value.getClass().getSimpleName());
   }
 
   private static boolean isOkMap(Object value) {
@@ -126,38 +114,10 @@ public final class StdResult {
     return value instanceof Map<?, ?> m && "Err".equals(m.get("_type"));
   }
 
-  private static Object readField(Object target, String... candidates) {
-    Class<?> cls = target.getClass();
-    for (String name : candidates) {
-      try {
-        Field f = cls.getField(name);
-        return f.get(target);
-      } catch (NoSuchFieldException ignored) {
-        // 尝试下一个候选字段名
-      } catch (IllegalAccessException e) {
-        throw new RuntimeException("Result helper: failed to access field '" + name + "'");
-      }
-    }
-    throw new RuntimeException("Result helper: missing value field on " + cls.getName());
-  }
-
   private static Object readMapPayload(Map<?, ?> map) {
     if (map.containsKey("value")) return map.get("value");
     if (map.containsKey("error")) return map.get("error");
     return null;
-  }
-
-  private static Object rebuildVariant(Object original, Object newValue, boolean isOk) {
-    Class<?> cls = original.getClass();
-
-    try {
-      Constructor<?> ctor = cls.getConstructor(Object.class);
-      return ctor.newInstance(newValue);
-    } catch (ReflectiveOperationException ignored) {
-      // 回退到默认实现
-    }
-
-    return isOk ? new Ok<>(newValue) : new Err<>(newValue);
   }
 
   private static String typeName(Object value) {

@@ -41,6 +41,20 @@ public final class ReplayDeterministicUuid {
     }
 
     /**
+     * 将给定实例绑定到当前线程。
+     *
+     * <p>用于把某个 workflow 的 {@link DeterminismContext} 拥有的实例绑定到
+     * 实际执行该 workflow 的（线程池）线程上。必须在执行线程上的
+     * {@code finally} 中调用 {@link #clearCurrent()} 复位。
+     *
+     * @param instance 要绑定的实例
+     */
+    public static void setCurrent(ReplayDeterministicUuid instance) {
+        Objects.requireNonNull(instance, "instance");
+        THREAD_LOCAL.set(instance);
+    }
+
+    /**
      * 清理当前线程绑定的实例，避免线程复用导致状态泄漏。
      */
     public static void clearCurrent() {

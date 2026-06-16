@@ -69,10 +69,22 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
         InMemoryExecutionHandle handle = new InMemoryExecutionHandle(workflowId, resultFuture);
 
         // 为每个 workflow 创建独立的 DeterminismContext
-        contexts.computeIfAbsent(workflowId, k -> new DeterminismContext());
+        DeterminismContext context = contexts.computeIfAbsent(workflowId, k -> new DeterminismContext());
 
-        // 重置 ThreadLocal 确保废弃接口获取的是新 context（避免跨 workflow 污染）
-        threadLocalContext.remove();
+        // TODO(#4): determinism 机制统一 —— 正确的绑定点。
+        //   本运行时只负责"调度"（记录状态 + 追加 STARTED 事件），workflow 的
+        //   实际执行 runnable 不在本仓库内（由 emitter 生成的代码 / 上层 orchestrator
+        //   在线程池线程上运行）。因此 ThreadLocal 的确定性实例必须由那个执行
+        //   runnable 在其自己的（执行）线程上设置与清理，而不是在这里（调度线程）。
+        //   已提供安全原语：
+        //       runtime.getDeterminismContext(workflowId).runWith(() -> <workflow body>);
+        //   它在执行线程上 setCurrent(uuid/random)，并在 finally 中复位，从而消除
+        //   "调度线程 reset、执行线程污染"的跨 workflow 串扰。
+        //   旧代码在调度线程上调用 threadLocalContext.remove() 是错误的（清理的是
+        //   错误的线程），已移除。一旦执行 runnable 在本仓库内可见，应在其入口
+        //   处接入 context.runWith(...)。
+        //   下面这行仅为编译期保留对 context 的引用，不产生副作用。
+        assert context != null;
 
         // 记录执行状态
         WorkflowExecutionState state = new WorkflowExecutionState(handle, metadata, idempotencyKey);
@@ -141,22 +153,19 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param result 执行结果
      */
     public void completeWorkflow(String workflowId, Object result) {
-        // 使用 remove() 而非 get()，避免内存泄漏和幂等污染
+        // 由当前状态决定是否记录终态事件，而非依赖 executions 是否存在条目。
+        // 这样即使执行状态已被先前的调用清理（例如迟到的 complete），仍能写入终态事件。
+        if (isTerminal(workflowId)) {
+            return;
+        }
         WorkflowExecutionState state = executions.remove(workflowId);
-        if (state != null) {
-            try {
+        try {
+            if (state != null) {
                 state.handle.complete(result);
-                eventStore.appendEvent(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, result);
-            } finally {
-                // 确保即使 appendEvent 抛异常，资源也能正确释放
-                if (state.idempotencyKey != null) {
-                    idempotencyManager.release(state.idempotencyKey);
-                }
-                // 清理 DeterminismContext 避免内存泄漏
-                contexts.remove(workflowId);
-                // 清理 ThreadLocal 避免跨 workflow 污染
-                threadLocalContext.remove();
             }
+            eventStore.appendEvent(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, result);
+        } finally {
+            releaseTerminalResources(workflowId, state);
         }
     }
 
@@ -167,23 +176,65 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param error 失败原因
      */
     public void failWorkflow(String workflowId, Throwable error) {
-        // 使用 remove() 而非 get()，避免内存泄漏和幂等污染
-        WorkflowExecutionState state = executions.remove(workflowId);
-        if (state != null) {
-            try {
-                state.handle.fail(error);
-                eventStore.appendEvent(workflowId, WorkflowEvent.Type.WORKFLOW_FAILED, error.getMessage());
-            } finally {
-                // 确保即使 appendEvent 抛异常，资源也能正确释放
-                if (state.idempotencyKey != null) {
-                    idempotencyManager.release(state.idempotencyKey);
-                }
-                // 清理 DeterminismContext 避免内存泄漏
-                contexts.remove(workflowId);
-                // 清理 ThreadLocal 避免跨 workflow 污染
-                threadLocalContext.remove();
-            }
+        // 与 completeWorkflow 对称：按当前状态判断是否已是终态，保证幂等。
+        if (isTerminal(workflowId)) {
+            return;
         }
+        WorkflowExecutionState state = executions.remove(workflowId);
+        try {
+            if (state != null) {
+                state.handle.fail(error);
+            }
+            // 持久化非空的失败原因：error.getMessage() 对很多异常为 null。
+            // 改为记录完整的 throwable 类名 + message 链，便于回放与排障。
+            eventStore.appendEvent(workflowId, WorkflowEvent.Type.WORKFLOW_FAILED, describeThrowable(error));
+        } finally {
+            releaseTerminalResources(workflowId, state);
+        }
+    }
+
+    /**
+     * 判断 workflow 是否已处于终态（COMPLETED / FAILED），用于幂等终态转移。
+     */
+    private boolean isTerminal(String workflowId) {
+        return eventStore.getState(workflowId)
+                .map(s -> s.getStatus() == WorkflowState.Status.COMPLETED
+                        || s.getStatus() == WorkflowState.Status.FAILED)
+                .orElse(false);
+    }
+
+    /**
+     * 释放终态相关资源（幂等键、DeterminismContext、ThreadLocal）。
+     */
+    private void releaseTerminalResources(String workflowId, WorkflowExecutionState state) {
+        if (state != null && state.idempotencyKey != null) {
+            idempotencyManager.release(state.idempotencyKey);
+        }
+        contexts.remove(workflowId);
+        threadLocalContext.remove();
+    }
+
+    /**
+     * 将异常链构造为非空的可读字符串：类名 + message，逐级追加 cause。
+     */
+    private static String describeThrowable(Throwable error) {
+        if (error == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder();
+        Throwable t = error;
+        java.util.Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        while (t != null && seen.add(t)) {
+            if (sb.length() > 0) {
+                sb.append("; caused by: ");
+            }
+            sb.append(t.getClass().getName());
+            if (t.getMessage() != null) {
+                sb.append(": ").append(t.getMessage());
+            }
+            t = t.getCause();
+        }
+        return sb.toString();
     }
 
     // ==================== 内部类 ====================

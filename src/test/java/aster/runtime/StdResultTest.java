@@ -107,4 +107,70 @@ class StdResultTest {
     Map<Object, Object> ok = StdResult.okMap(1);
     assertThrows(NullPointerException.class, () -> StdResult.mapOk(ok, null));
   }
+
+  // ==================== 对象表示 (Ok/Err 密封类型) ====================
+  // 这些用例验证 #4：用 instanceof Ok/Err 的模式匹配取代反射读字段，
+  // 并修正 Err 字段名（error，而非 value）。
+
+  @Test
+  void unwrapReturnsOkObjectValue() {
+    Result<String, String> ok = new Ok<>("hello");
+    assertEquals("hello", StdResult.unwrap(ok));
+  }
+
+  @Test
+  void unwrapThrowsOnErrObject() {
+    Result<String, String> err = new Err<>("boom");
+    assertThrows(RuntimeException.class, () -> StdResult.unwrap(err));
+  }
+
+  @Test
+  void unwrapErrReturnsErrObjectError() {
+    // 历史 bug：候选字段名为 ("value","error")，但 Err 声明的是 error；
+    // 旧反射实现先匹配不到 value 才回退到 error。模式匹配直接读 err.error。
+    Result<String, String> err = new Err<>("the-error");
+    assertEquals("the-error", StdResult.unwrapErr(err));
+  }
+
+  @Test
+  void unwrapErrThrowsOnOkObject() {
+    Result<String, String> ok = new Ok<>("ok");
+    assertThrows(RuntimeException.class, () -> StdResult.unwrapErr(ok));
+  }
+
+  @Test
+  void mapOkOverOkObjectReturnsNewOk() {
+    Result<Integer, String> ok = new Ok<>(5);
+    Fn1<Object, Object> doubleIt = x -> ((Integer) x) * 2;
+    Object mapped = StdResult.mapOk(ok, doubleIt);
+    assertInstanceOf(Ok.class, mapped);
+    assertEquals(10, StdResult.unwrap(mapped));
+  }
+
+  @Test
+  void mapOkOverErrObjectIsUnchanged() {
+    Result<Integer, String> err = new Err<>("nope");
+    Fn1<Object, Object> doubleIt = x -> ((Integer) x) * 2;
+    Object mapped = StdResult.mapOk(err, doubleIt);
+    assertSame(err, mapped);
+    assertEquals("nope", StdResult.unwrapErr(mapped));
+  }
+
+  @Test
+  void mapErrOverErrObjectReturnsNewErr() {
+    Result<Integer, String> err = new Err<>("bad");
+    Fn1<Object, Object> upper = x -> ((String) x).toUpperCase();
+    Object mapped = StdResult.mapErr(err, upper);
+    assertInstanceOf(Err.class, mapped);
+    assertEquals("BAD", StdResult.unwrapErr(mapped));
+  }
+
+  @Test
+  void mapErrOverOkObjectIsUnchanged() {
+    Result<Integer, String> ok = new Ok<>(7);
+    Fn1<Object, Object> upper = x -> ((String) x).toUpperCase();
+    Object mapped = StdResult.mapErr(ok, upper);
+    assertSame(ok, mapped);
+    assertEquals(7, StdResult.unwrap(mapped));
+  }
 }
