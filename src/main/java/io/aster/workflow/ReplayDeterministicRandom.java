@@ -49,6 +49,21 @@ public final class ReplayDeterministicRandom {
     }
 
     /**
+     * 将给定实例绑定到当前线程。
+     *
+     * <p>用于把某个 workflow 的 {@link DeterminismContext} 拥有的实例绑定到
+     * 实际执行该 workflow 的（线程池）线程上，使后续 {@link #current()} 返回
+     * 同一实例，避免 ThreadLocal 默认 new 出的实例与 per-workflow 实例脱节。
+     * 必须在执行线程上的 {@code finally} 中调用 {@link #clearCurrent()} 复位。
+     *
+     * @param instance 要绑定的实例
+     */
+    public static void setCurrent(ReplayDeterministicRandom instance) {
+        Objects.requireNonNull(instance, "instance");
+        THREAD_LOCAL.set(instance);
+    }
+
+    /**
      * 清理线程绑定实例，供线程复用场景显式释放。
      */
     public static void clearCurrent() {
@@ -84,14 +99,20 @@ public final class ReplayDeterministicRandom {
     }
 
     /**
-     * 生成 double，直接复用 long bit-pattern，保证重放一致性。
+     * 生成 [0,1) 区间的均匀 double。
+     *
+     * 旧实现使用 {@code Double.longBitsToDouble(nextLong())}，会把任意 64 位
+     * bit-pattern 直接解释为 double，从而频繁产生 NaN / Inf / 超出 [0,1)
+     * 的非均匀值。此处改用标准做法：取 long 的高 53 位作为尾数，乘以
+     * 2^-53，得到 [0,1) 上均匀分布且永远有限的 double。录制/重放语义不变，
+     * 因为底层仍走 {@link #nextLong(String)}（重放时返回相同的 long → 相同 double）。
      *
      * @param source 调用来源标识
-     * @return 确定性的 double
+     * @return [0,1) 区间内确定性的 double
      */
     public double nextDouble(String source) {
         long bits = nextLong(source);
-        return Double.longBitsToDouble(bits);
+        return (bits >>> 11) * 0x1.0p-53;
     }
 
     /**

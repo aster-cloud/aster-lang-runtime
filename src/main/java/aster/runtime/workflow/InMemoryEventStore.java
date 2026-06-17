@@ -93,7 +93,16 @@ public class InMemoryEventStore implements EventStore {
      */
     @Override
     public Optional<WorkflowState> getState(String workflowId) {
-        return Optional.ofNullable(states.get(workflowId));
+        // 通过与写入相同的 per-workflow 锁读取，避免在 appendEvent/saveSnapshot
+        // 进行多步状态构建时读到不一致的中间态。WorkflowState 本身不可变，
+        // 因此在锁内取得引用后即可安全返回。
+        List<WorkflowEvent> eventList = events.get(workflowId);
+        if (eventList == null) {
+            return Optional.ofNullable(states.get(workflowId));
+        }
+        synchronized (eventList) {
+            return Optional.ofNullable(states.get(workflowId));
+        }
     }
 
     /**
@@ -138,7 +147,17 @@ public class InMemoryEventStore implements EventStore {
      */
     @Override
     public Optional<WorkflowSnapshot> getLatestSnapshot(String workflowId) {
-        WorkflowState state = states.get(workflowId);
+        // 与 getState 一致：在 per-workflow 锁内读取，保证 snapshot 与 snapshotSeq
+        // 来自同一个不可变状态对象，避免与并发 saveSnapshot 的撕裂读。
+        List<WorkflowEvent> eventList = events.get(workflowId);
+        WorkflowState state;
+        if (eventList == null) {
+            state = states.get(workflowId);
+        } else {
+            synchronized (eventList) {
+                state = states.get(workflowId);
+            }
+        }
         if (state != null && state.getSnapshot() != null) {
             return Optional.of(new WorkflowSnapshot(
                     workflowId,

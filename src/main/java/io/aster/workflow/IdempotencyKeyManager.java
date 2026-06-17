@@ -22,7 +22,6 @@ public class IdempotencyKeyManager {
 
     private final Cache cache;
     private final Map<String, String> fallbackCache;
-    private final Map<String, Object> localLocks = new ConcurrentHashMap<>();
 
     /**
      * 默认构造函数：提供非 CDI 场景的本地并发 Map 实现。
@@ -57,17 +56,24 @@ public class IdempotencyKeyManager {
         }
 
         if (cache != null) {
-            Object mutex = localLocks.computeIfAbsent(key, ignored -> new Object());
-            synchronized (mutex) {
+            // localLocks 仅用于把"读取-或-写入"序列化到同一 key 上。为避免该
+            // side-map 随 key 数量无界增长（缓存条目会过期，但 localLocks 不会），
+            // 采用 key 的 intern 字符串本身作为监视器，从而不需要单独维护一张表。
+            synchronized (key.intern()) {
                 String existing = cache.get(key, k -> entityId).await().indefinitely();
+                // 首次写入返回我们自己的 entityId（empty=获得控制权）；
+                // 否则返回既有占用者。
                 return entityId.equals(existing) ? Optional.empty() : Optional.of(existing);
             }
         }
 
         String current = fallbackCache.putIfAbsent(key, entityId);
-        if (current == null || entityId.equals(current)) {
+        if (current == null) {
+            // 首次获取，成功获得控制权。
             return Optional.empty();
         }
+        // 同一 (key, entityId) 重复获取：返回既有句柄标识，确保重试不会重复启动
+        // 一个新的 workflow（调用方据此复用已存在的 ExecutionHandle）。
         return Optional.of(current);
     }
 
@@ -80,7 +86,6 @@ public class IdempotencyKeyManager {
         Objects.requireNonNull(key, "幂等性键不能为空");
         if (cache != null) {
             cache.invalidate(key).await().indefinitely();
-            localLocks.remove(key);
         } else {
             fallbackCache.remove(key);
         }
