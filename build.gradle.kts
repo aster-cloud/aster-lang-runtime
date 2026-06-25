@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "cloud.aster-lang"
-version = "1.0.3"
+version = "1.0.4"
 
 publishing {
     publications {
