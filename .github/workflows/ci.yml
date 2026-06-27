@@ -12,6 +12,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # 防漂移 gate（ADR 0023 阶段6）：本仓版本须符合 release-plan.json 单一事实源
+      # （脚本+plan 在 platform 仓，单点维护）。本仓无 platform 依赖，故为 gate 单独
+      # checkout platform。PR 时即拦截漂移。
+      - uses: actions/checkout@v6
+        with:
+          repository: aster-cloud/aster-lang-platform
+          path: aster-lang-platform
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Release-plan drift gate
+        run: |
+          python3 aster-lang-platform/scripts/release-plan/check-artifact.py \
+            --plan aster-lang-platform/release-plan.json \
+            --artifact runtime:maven --repo-root .
+
       - uses: actions/setup-java@v5
         with:
           java-version: '25'
