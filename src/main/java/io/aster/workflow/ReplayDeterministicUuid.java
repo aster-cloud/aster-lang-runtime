@@ -37,6 +37,10 @@ public final class ReplayDeterministicUuid {
      * @return 当前线程实例
      */
     public static ReplayDeterministicUuid current() {
+        // 警告（#4，未接线）：在共享线程池上，若执行 runnable 未通过
+        // DeterminismContext#runWith(...) 绑定 per-workflow 实例，本方法返回的是执行线程
+        // 的 ThreadLocal 默认实例，可能与调度侧的 per-workflow 实例脱节并跨 workflow 串扰。
+        // 在接线完成前，池化线程上使用静态 current() 不安全。
         return THREAD_LOCAL.get();
     }
 
@@ -140,6 +144,19 @@ public final class ReplayDeterministicUuid {
      */
     public List<UUID> getRecordedUuids() {
         return new ArrayList<>(recorded);
+    }
+
+    /**
+     * 本次录制/重放是否因触达 {@link #MAX_RECORDS} 上限而发生截断（因而记录不再完整、
+     * 不可安全重放）。
+     *
+     * <p>与 {@link ReplayDeterministicClock}（无上限，录制始终完整）对齐 cap 语义：使
+     * “已达上限并丢弃”从静默行为变为<em>可检测</em>状态，供上层选择失败或标记为 incomplete。
+     *
+     * @return true 表示记录已被截断
+     */
+    public boolean isRecordLimitReached() {
+        return recordLimitReached;
     }
 
     /**

@@ -2,8 +2,15 @@ package aster.runtime.workflow;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -88,6 +95,129 @@ class InMemoryWorkflowRuntimeTest {
     runtime.completeWorkflow("wf-4", "done");
     assertEquals(WorkflowState.Status.COMPLETED,
         runtime.getEventStore().getState("wf-4").orElseThrow().getStatus());
+  }
+
+  @Test
+  void concurrentScheduleWithSameIdempotencyKeyStartsExactlyOneWorkflow() throws Exception {
+    // 审计 #19 [HIGH]：两个并发 schedule() 使用同一幂等键，必须恰好启动一个 workflow，
+    // 且败者返回胜者的句柄，绝不释放胜者的键去启动自己的 workflow。
+    final int rounds = 200;
+    for (int round = 0; round < rounds; round++) {
+      InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+      String key = "idem-" + round;
+      String wfA = "wf-a-" + round;
+      String wfB = "wf-b-" + round;
+
+      CyclicBarrier barrier = new CyclicBarrier(2);
+      ConcurrentLinkedQueue<ExecutionHandle> handles = new ConcurrentLinkedQueue<>();
+      ExecutorService pool = Executors.newFixedThreadPool(2);
+      try {
+        Runnable a = scheduleTask(runtime, wfA, key, barrier, handles);
+        Runnable b = scheduleTask(runtime, wfB, key, barrier, handles);
+        pool.submit(a);
+        pool.submit(b);
+      } finally {
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+      }
+
+      // 恰好一个 workflowId 记录了 WORKFLOW_STARTED（即恰好启动一次）。
+      int started = 0;
+      for (String wf : List.of(wfA, wfB)) {
+        Optional<WorkflowState> s = runtime.getEventStore().getState(wf);
+        if (s.isPresent()) {
+          assertEquals(WorkflowState.Status.READY, s.get().getStatus(),
+              "the started workflow must be READY (WORKFLOW_STARTED appended)");
+          started++;
+        }
+      }
+      assertEquals(1, started,
+          "exactly one workflow may start for a single idempotency key (round " + round + ")");
+
+      // 两个调用返回的句柄必须是同一个（胜者的句柄）。
+      assertEquals(2, handles.size());
+      ExecutionHandle h1 = handles.poll();
+      ExecutionHandle h2 = handles.poll();
+      assertSame(h1, h2, "loser must receive the winner's handle, not a fresh one (round " + round + ")");
+    }
+  }
+
+  private static Runnable scheduleTask(InMemoryWorkflowRuntime runtime, String workflowId, String key,
+                                       CyclicBarrier barrier, ConcurrentLinkedQueue<ExecutionHandle> sink) {
+    return () -> {
+      try {
+        barrier.await(5, TimeUnit.SECONDS);
+        sink.add(runtime.schedule(workflowId, key, new WorkflowMetadata()));
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    };
+  }
+
+  @Test
+  void concurrentCompleteAndFailLeaveSingleTerminalState() throws Exception {
+    // 审计 #19 [MED]：complete 与 fail 并发时，终态转移必须原子——最终恰好一个终态，
+    // 且事件存储中的状态与 CompletableFuture 结果一致（不出现 COMPLETED→FAILED 分叉）。
+    final int rounds = 500;
+    AtomicInteger completedWins = new AtomicInteger();
+    AtomicInteger failedWins = new AtomicInteger();
+    for (int round = 0; round < rounds; round++) {
+      InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+      String wf = "wf-term-" + round;
+      ExecutionHandle handle = runtime.schedule(wf, null, new WorkflowMetadata());
+
+      CyclicBarrier barrier = new CyclicBarrier(2);
+      ExecutorService pool = Executors.newFixedThreadPool(2);
+      try {
+        pool.submit(() -> {
+          awaitQuietly(barrier);
+          runtime.completeWorkflow(wf, "ok");
+        });
+        pool.submit(() -> {
+          awaitQuietly(barrier);
+          runtime.failWorkflow(wf, new RuntimeException("boom"));
+        });
+      } finally {
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+      }
+
+      WorkflowState state = runtime.getEventStore().getState(wf).orElseThrow();
+      WorkflowState.Status status = state.getStatus();
+      assertTrue(status == WorkflowState.Status.COMPLETED || status == WorkflowState.Status.FAILED,
+          "must land on a terminal state, got " + status + " (round " + round + ")");
+
+      // 事件存储中的终态必须与句柄结果一致。
+      if (status == WorkflowState.Status.COMPLETED) {
+        completedWins.incrementAndGet();
+        assertEquals("ok", handle.getResult().get(1, TimeUnit.SECONDS),
+            "COMPLETED state must match a successfully-completed future");
+      } else {
+        failedWins.incrementAndGet();
+        ExecutionException ex = assertThrows(ExecutionException.class,
+            () -> handle.getResult().get(1, TimeUnit.SECONDS));
+        assertTrue(ex.getCause() instanceof RuntimeException,
+            "FAILED state must match an exceptionally-completed future");
+      }
+
+      // 只应存在一个终态事件（不应既有 COMPLETED 又有 FAILED）。
+      long terminalEvents = runtime.getEventStore().getEvents(wf, 0).stream()
+          .filter(e -> WorkflowEvent.Type.WORKFLOW_COMPLETED.equals(e.getEventType())
+              || WorkflowEvent.Type.WORKFLOW_FAILED.equals(e.getEventType()))
+          .count();
+      assertEquals(1, terminalEvents,
+          "exactly one terminal event may be recorded (round " + round + ")");
+    }
+    // 两种结果都应在多轮中出现，确认竞态确实被驱动（非确定性防御，不强制严格）。
+    assertTrue(completedWins.get() + failedWins.get() == rounds);
+  }
+
+  private static void awaitQuietly(CyclicBarrier barrier) {
+    try {
+      barrier.await(5, TimeUnit.SECONDS);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
   }
 
   @Test

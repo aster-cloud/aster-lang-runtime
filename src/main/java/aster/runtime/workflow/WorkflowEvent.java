@@ -3,6 +3,7 @@ package aster.runtime.workflow;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -97,9 +98,15 @@ public class WorkflowEvent {
      *
      * 负载包含事件相关的具体数据，格式取决于事件类型。
      *
+     * <p>当负载为 {@link Map} 时，返回一个不可变的防御性拷贝，避免调用方修改回写到
+     * 事件内部持有的可变 Map（例如 step 事件的 payload）。
+     *
      * @return 事件负载
      */
     public Object getPayload() {
+        if (payload instanceof Map<?, ?> map) {
+            return Collections.unmodifiableMap(new LinkedHashMap<>(map));
+        }
         return payload;
     }
 

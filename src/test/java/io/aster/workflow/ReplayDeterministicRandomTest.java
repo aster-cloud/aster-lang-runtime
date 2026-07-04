@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -41,5 +42,39 @@ class ReplayDeterministicRandomTest {
     }
 
     assertEquals(first, second, "replay must reproduce the recorded sequence deterministically");
+  }
+
+  @Test
+  void recordingPastCapIsDetectable() {
+    // 审计 #19 [MED]：录制超过单 source 上限后不得静默丢弃——必须可检测。
+    ReplayDeterministicRandom rnd = new ReplayDeterministicRandom();
+    for (int i = 0; i < ReplayDeterministicRandom.MAX_RECORDS_PER_SOURCE; i++) {
+      rnd.nextLong("s");
+    }
+    assertFalse(rnd.isRecordLimitReached(), "at exactly the cap the recording is still complete");
+    assertTrue(rnd.getTruncatedSources().isEmpty());
+
+    // 越过上限后：值仍返回给 workflow，但记录被丢弃 —— 现在这是可检测的。
+    rnd.nextLong("s");
+    assertTrue(rnd.isRecordLimitReached(), "recording past the cap must be detectable");
+    assertTrue(rnd.getTruncatedSources().contains("s"));
+    assertEquals(ReplayDeterministicRandom.MAX_RECORDS_PER_SOURCE,
+        rnd.getRecordedRandoms().get("s").size(), "recorded values are capped");
+  }
+
+  @Test
+  void enterReplayModeFlagsTruncationWhenInputExceedsCap() {
+    // 从超长外部序列进入重放模式同样应被标记为截断。
+    java.util.Map<String, List<Long>> oversized = new java.util.HashMap<>();
+    List<Long> values = new ArrayList<>();
+    for (int i = 0; i < ReplayDeterministicRandom.MAX_RECORDS_PER_SOURCE + 5; i++) {
+      values.add((long) i);
+    }
+    oversized.put("s", values);
+
+    ReplayDeterministicRandom rnd = new ReplayDeterministicRandom();
+    rnd.enterReplayMode(oversized);
+    assertTrue(rnd.isRecordLimitReached(), "truncated replay input must be detectable");
+    assertTrue(rnd.getTruncatedSources().contains("s"));
   }
 }

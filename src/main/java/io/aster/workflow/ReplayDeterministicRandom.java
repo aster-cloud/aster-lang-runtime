@@ -37,6 +37,10 @@ public final class ReplayDeterministicRandom {
     private final Map<String, List<Long>> recorded = new LinkedHashMap<>();
     private final Map<String, Integer> replayIndices = new HashMap<>();
     private final Set<String> limitWarnedSources = new HashSet<>();
+    // 记录是否有任何 source 触达上限而发生截断。一旦为 true，本次录制不再完整，
+    // 因此不可安全重放（回放会在第 501 次调用抛出）。通过 isRecordLimitReached()
+    // 对外可检测，避免“悄悄丢弃 → 永久不可重放”。
+    private final Set<String> truncatedSources = new HashSet<>();
     private boolean replayMode = false;
 
     /**
@@ -45,6 +49,10 @@ public final class ReplayDeterministicRandom {
      * @return 当前线程实例
      */
     public static ReplayDeterministicRandom current() {
+        // 警告（#4，未接线）：在共享线程池上，若执行 runnable 未通过
+        // DeterminismContext#runWith(...) 绑定 per-workflow 实例，本方法返回的是执行线程
+        // 的 ThreadLocal 默认实例，可能与调度侧的 per-workflow 实例脱节并跨 workflow 串扰。
+        // 在接线完成前，池化线程上使用静态 current() 不安全。
         return THREAD_LOCAL.get();
     }
 
@@ -150,6 +158,7 @@ public final class ReplayDeterministicRandom {
                 LOG.log(Level.WARNING,
                         String.format("随机源 %s 的重放序列超过上限 %d，已截断", source, MAX_RECORDS_PER_SOURCE));
                 limitWarnedSources.add(source);
+                truncatedSources.add(source);
             }
         });
 
@@ -163,7 +172,30 @@ public final class ReplayDeterministicRandom {
         this.replayMode = false;
         this.replayIndices.clear();
         this.limitWarnedSources.clear();
+        this.truncatedSources.clear();
         this.recorded.clear();
+    }
+
+    /**
+     * 本次录制/重放是否因触达单 source 上限而发生截断（因而不再完整、不可安全重放）。
+     *
+     * <p>与 {@link ReplayDeterministicClock}（无上限，录制始终完整）对齐 cap 语义：
+     * 该标志使“已达上限并丢弃”从静默行为变为<em>可检测</em>状态，供上层选择让本次执行
+     * 失败或将录制标记为 incomplete，而非留下永久不可重放的记录。
+     *
+     * @return true 表示存在被截断的 source
+     */
+    public boolean isRecordLimitReached() {
+        return !truncatedSources.isEmpty();
+    }
+
+    /**
+     * 返回已触达上限而被截断的 source 集合（防御性拷贝）。
+     *
+     * @return 被截断的 source 名称集合
+     */
+    public Set<String> getTruncatedSources() {
+        return new HashSet<>(truncatedSources);
     }
 
     /**
@@ -183,6 +215,8 @@ public final class ReplayDeterministicRandom {
     private void appendRecordedValue(String source, long value) {
         List<Long> values = recorded.computeIfAbsent(source, k -> new ArrayList<>(MAX_RECORDS_PER_SOURCE));
         if (values.size() >= MAX_RECORDS_PER_SOURCE) {
+            // 标记该 source 已截断：录制不再完整，可通过 isRecordLimitReached() 检测。
+            truncatedSources.add(source);
             emitLimitWarningOnce(source);
             return;
         }
@@ -229,6 +263,7 @@ public final class ReplayDeterministicRandom {
         this.recorded.clear();
         this.replayIndices.clear();
         this.limitWarnedSources.clear();
+        this.truncatedSources.clear();
         this.replayMode = false;
     }
 }
