@@ -41,12 +41,22 @@ public class InMemoryEventStore implements EventStore {
         // 同步块确保 size() + add() + updateState() 原子性
         // 避免并发时状态更新顺序错乱导致 lastEventSeq 回滚
         synchronized (eventList) {
+            // 终态闩锁（防御性，独立于运行时的 per-workflow 锁）：一旦进入 COMPLETED/FAILED，
+            // 拒绝第二次终态转移（例如 COMPLETED→FAILED），使状态与 workflow 的
+            // CompletableFuture 结果始终一致。补偿等非终态事件仍允许在终态后追加。
+            WorkflowState current = states.get(workflowId);
+            if (isTerminalEvent(eventType) && current != null && isTerminalStatus(current.getStatus())) {
+                return current.getLastEventSeq();
+            }
+
             nextSeq = eventList.size() + 1;
             WorkflowEvent event = new WorkflowEvent(
                     nextSeq,
                     workflowId,
                     eventType,
-                    payload,
+                    // 冗余化边界：绝不持久化原始 Throwable 链（栈/被包裹对象含 PII），
+                    // 仅保留 类名 + 单行 message。
+                    redactPayload(payload),
                     Instant.now(),
                     attemptNumber != null ? attemptNumber : 1,
                     backoffDelayMs,
@@ -177,6 +187,42 @@ public class InMemoryEventStore implements EventStore {
     }
 
     // ==================== 私有辅助方法 ====================
+
+    /**
+     * 是否为终态事件（WORKFLOW_COMPLETED / WORKFLOW_FAILED）。
+     */
+    private static boolean isTerminalEvent(String eventType) {
+        return WorkflowEvent.Type.WORKFLOW_COMPLETED.equals(eventType)
+                || WorkflowEvent.Type.WORKFLOW_FAILED.equals(eventType);
+    }
+
+    /**
+     * 是否为终态状态（COMPLETED / FAILED）。
+     */
+    private static boolean isTerminalStatus(WorkflowState.Status status) {
+        return status == WorkflowState.Status.COMPLETED
+                || status == WorkflowState.Status.FAILED;
+    }
+
+    /**
+     * 冗余化/序列化边界：对进入事件存储的 payload 做安全化处理。
+     *
+     * <p>当前策略：{@link Throwable} 永不以原始对象持久化——仅保留类名 + 单行 message，
+     * 避免栈轨迹或被包裹的上下文对象（可能含 PII）落库。其余 payload 原样保留；
+     * 事件的不可变性由 {@link WorkflowEvent#getPayload()} 的防御性拷贝进一步保证。
+     */
+    private static Object redactPayload(Object payload) {
+        if (payload instanceof Throwable t) {
+            String message = t.getMessage();
+            if (message == null) {
+                return t.getClass().getName();
+            }
+            // 折叠换行，避免多行/注入式日志。
+            String sanitized = message.replaceAll("[\\r\\n]+", " ").trim();
+            return t.getClass().getName() + ": " + sanitized;
+        }
+        return payload;
+    }
 
     /**
      * 根据事件更新工作流状态

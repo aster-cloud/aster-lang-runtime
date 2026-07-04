@@ -74,4 +74,39 @@ class InMemoryEventStoreTest {
     }
     assertFalse(regressed.get(), "lastEventSeq observed by a single reader must be monotonic");
   }
+
+  @Test
+  void terminalStateIsALatchAtStoreLevel() {
+    // 审计 #19 [MED] 防御层：store 直接被误用地追加第二个终态事件时，也必须拒绝
+    // COMPLETED→FAILED，保持终态与序列一致。
+    InMemoryEventStore store = new InMemoryEventStore();
+    store.appendEvent("wf", WorkflowEvent.Type.WORKFLOW_STARTED, null);
+    store.appendEvent("wf", WorkflowEvent.Type.WORKFLOW_COMPLETED, "done");
+    long seqAfterComplete = store.getState("wf").orElseThrow().getLastEventSeq();
+
+    // 第二次终态转移应被拒绝（no-op）。
+    store.appendEvent("wf", WorkflowEvent.Type.WORKFLOW_FAILED, "should-be-rejected");
+
+    WorkflowState state = store.getState("wf").orElseThrow();
+    assertEquals(WorkflowState.Status.COMPLETED, state.getStatus(),
+        "terminal state must not flip COMPLETED->FAILED");
+    assertEquals(seqAfterComplete, state.getLastEventSeq(),
+        "rejected terminal event must not advance the sequence");
+    assertEquals("done", state.getResult());
+  }
+
+  @Test
+  void throwablePayloadIsRedactedNotStoredRaw() {
+    // 审计 #19 [LOW]：不得持久化原始 Throwable 链（栈/被包裹对象含 PII），
+    // 仅保留 类名 + 单行 message。
+    InMemoryEventStore store = new InMemoryEventStore();
+    Throwable boom = new IllegalStateException("multi\nline\rsecret");
+    store.appendEvent("wf", WorkflowEvent.Type.STEP_FAILED, boom);
+
+    Object payload = store.getEvents("wf", 0).get(0).getPayload();
+    assertFalse(payload instanceof Throwable, "raw Throwable must not be persisted");
+    String s = payload.toString();
+    assertTrue(s.contains("IllegalStateException"), "must retain the exception class");
+    assertFalse(s.contains("\n") || s.contains("\r"), "message must be single-line/sanitized");
+  }
 }

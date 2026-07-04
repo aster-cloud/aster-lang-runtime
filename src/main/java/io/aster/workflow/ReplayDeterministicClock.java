@@ -98,4 +98,17 @@ public class ReplayDeterministicClock implements DeterministicClock {
     public List<Instant> getRecordedTimes() {
         return new ArrayList<>(recordedTimes);
     }
+
+    /**
+     * 与 {@link ReplayDeterministicUuid#isRecordLimitReached()} /
+     * {@link ReplayDeterministicRandom#isRecordLimitReached()} 对齐的 cap 检测方法。
+     *
+     * <p>时钟<b>不设记录上限</b>，因此录制始终完整、永不截断，本方法恒返回 {@code false}。
+     * 保留该 API 是为了让三个 facade 的 cap 语义统一、可被上层以相同方式查询。
+     *
+     * @return 恒为 {@code false}（时钟无上限）
+     */
+    public boolean isRecordLimitReached() {
+        return false;
+    }
 }
