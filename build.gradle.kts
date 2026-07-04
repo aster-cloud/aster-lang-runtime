@@ -44,8 +44,12 @@ java {
 repositories { mavenCentral() }
 
 dependencies {
-  // R21-Major-5：与 aster-api 对齐到 3.32.2，避免运行时库 BOM 漂移
-  implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.32.2"))
+  // R21-Major-5 / 审计 #32：与 aster-api 对齐 quarkus-bom，避免运行时库 BOM 漂移。
+  // aster-api 已升到 3.37.0——本库当初写死 3.32.2 后 api 单方面升级，导致本库的
+  // quarkus-cache/quarkus-core 按 3.32.2 编译测试、却在 aster-api 内解析为 3.37.0，
+  // Quarkus 行为变更只会在 aster-api 暴露而本库 CI 全绿。对齐到 3.37.0 消除漂移。
+  // （平台 catalog 已新增 asterLibs.quarkus.bom=3.37.0，catalog 发布后应迁移到别名。）
+  implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.37.0"))
   implementation("io.quarkus:quarkus-cache")
   implementation("io.quarkus:quarkus-core")
   implementation("io.smallrye.common:smallrye-common-net") // For CidrAddress (GraalVM substitutions)
