@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# 最小权限：本 CI 仅 checkout + build + test，无任何写副作用（不推 commit/tag、不发 release、
+# 不评论 PR、不推镜像、不上传 SARIF、无 OIDC 云登录）。跨仓 checkout platform 用独立
+# CROSS_REPO_TOKEN 而非默认 GITHUB_TOKEN，故 GITHUB_TOKEN 只需 contents: read 读取代码。
+permissions:
+  contents: read
+
 # 同一 ref 上新 push 到来时取消尚在跑的过时 CI（PR 连续 push 常见）——省算力/排队。
 # 该仓 CI 无发布/部署副作用（release 是独立 workflow），故可直接 cancel 过时 run。
 concurrency:
