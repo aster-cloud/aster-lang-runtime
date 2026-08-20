@@ -27,7 +27,7 @@ jobs:
       # 防漂移 gate（ADR 0023 阶段6）：本仓版本须符合 release-plan.json 单一事实源
       # （脚本+plan 在 platform 仓，单点维护）。本仓无 platform 依赖，故为 gate 单独
       # checkout platform。PR 时即拦截漂移。
-      - uses: actions/checkout@v6
+      - uses: aster-cloud/aster-lang-platform/.github/actions/checkout-sibling@main
         with:
           repository: aster-cloud/aster-lang-platform
           path: aster-lang-platform
