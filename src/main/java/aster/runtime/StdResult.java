@@ -12,6 +12,22 @@ public final class StdResult {
 
   /** 对 Ok 分支应用映射函数，Err 分支保持不变。 */
   @SuppressWarnings("unchecked")
+  /**
+   * 读取 Maybe/Result 变体标签，**同时容忍两种拼写**。
+   *
+   * <p>历史背景（aster-lang-ts#137）：TS 引擎产出 {@code __type}、Truffle 引擎产出
+   * {@code _type}，两侧长期不一致。等价性语料的 cases 全部以 {@code __type} 为准
+   * （39 处），故已把 Truffle 对齐到 {@code __type}。
+   *
+   * <p>本方法读两种是为了**跨版本兼容**：本类会消费不同版本引擎产出的值，
+   * 若只认新标签，旧引擎（或缓存的旧结果）产出的 {@code _type} 会静默落到
+   * "不是 Result" 分支、抛出误导性的类型错误。写入侧则统一为 {@code __type}。
+   */
+  private static Object variantTag(java.util.Map<?, ?> m) {
+    Object t = m.get("__type");
+    return t != null ? t : m.get("_type");
+  }
+
   public static Object mapOk(Object result, Object fn) {
     Fn1<Object, Object> mapper = (Fn1<Object, Object>) Objects.requireNonNull(fn, "fn");
 
@@ -24,10 +40,10 @@ public final class StdResult {
       return new Ok<>(mapped);
     }
 
-    if (result instanceof Map<?, ?> m && "Ok".equals(m.get("_type"))) {
+    if (result instanceof Map<?, ?> m && "Ok".equals(variantTag(m))) {
       Object mapped = mapper.apply(readMapPayload(m));
       Map<String, Object> copy = new HashMap<>();
-      copy.put("_type", "Ok");
+      copy.put("__type", "Ok");
       copy.put("value", mapped);
       return copy;
     }
@@ -49,10 +65,10 @@ public final class StdResult {
       return new Err<>(mapped);
     }
 
-    if (result instanceof Map<?, ?> m && "Err".equals(m.get("_type"))) {
+    if (result instanceof Map<?, ?> m && "Err".equals(variantTag(m))) {
       Object mapped = mapper.apply(readMapPayload(m));
       Map<String, Object> copy = new HashMap<>();
-      copy.put("_type", "Err");
+      copy.put("__type", "Err");
       copy.put("value", mapped);
       return copy;
     }
@@ -63,7 +79,7 @@ public final class StdResult {
   /** 构造 Ok 的 Map 表示。*/
   public static Map<Object, Object> okMap(Object value) {
     Map<Object, Object> map = new HashMap<>();
-    map.put("_type", "Ok");
+    map.put("__type", "Ok");
     map.put("value", value);
     return map;
   }
@@ -75,7 +91,7 @@ public final class StdResult {
   /** 构造 Err 的 Map 表示。*/
   public static Map<Object, Object> errMap(Object value) {
     Map<Object, Object> map = new HashMap<>();
-    map.put("_type", "Err");
+    map.put("__type", "Err");
     map.put("value", value);
     return map;
   }
@@ -107,11 +123,11 @@ public final class StdResult {
   }
 
   private static boolean isOkMap(Object value) {
-    return value instanceof Map<?, ?> m && "Ok".equals(m.get("_type"));
+    return value instanceof Map<?, ?> m && "Ok".equals(variantTag(m));
   }
 
   private static boolean isErrMap(Object value) {
-    return value instanceof Map<?, ?> m && "Err".equals(m.get("_type"));
+    return value instanceof Map<?, ?> m && "Err".equals(variantTag(m));
   }
 
   private static Object readMapPayload(Map<?, ?> map) {
