@@ -19,6 +19,9 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class InMemoryWorkflowRuntime implements WorkflowRuntime {
 
+    private static final System.Logger LOGGER =
+            System.getLogger(InMemoryWorkflowRuntime.class.getName());
+
     private final Map<String, WorkflowExecutionState> executions = new ConcurrentHashMap<>();
     private final Map<String, DeterminismContext> contexts = new ConcurrentHashMap<>();
     // 每个 workflowId 一把锁，使"检查是否终态 + 追加终态事件"成为单一原子 CAS，
@@ -165,15 +168,75 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
     }
 
     /**
-     * 关闭运行时
+     * shutdown 等待在途 workflow 的默认上限。
+     *
+     * <p>可用系统属性 {@code aster.workflow.shutdownGraceMillis} 覆盖——测试需要短 grace
+     * 才能在秒级内验证「超时后取消 + 补终态事件」这条路径，
+     * 而生产需要足够长的等待才不至于把正常收尾的 workflow 掐断。
+     * 两者不该二选一，故做成可配置而非硬编码。
+     */
+    static final Duration SHUTDOWN_GRACE = Duration.ofMillis(
+            Long.getLong("aster.workflow.shutdownGraceMillis", 30_000L));
+
+    /**
+     * 关闭运行时：**先等待、超时才取消**，并为被取消者补写终态事件（issue #42）。
+     *
+     * <p>★此前的实现直接 {@code state.handle.cancel()} 后 {@code executions.clear()}——
+     * 既不等待也无超时，而接口 javadoc 明写「此方法应等待所有进行中的 workflow
+     * 执行完成或超时后再返回」。**注释声称 ≠ 实现**。
+     *
+     * <p>更糟的是被取消的 workflow **不写任何终态事件**：事件存储里这些 workflow
+     * 永远停在非终态（只有 WORKFLOW_STARTED），事后回放/审计无法区分
+     * 「还在跑」与「被 shutdown 掐断」。故取消后补一条 WORKFLOW_FAILED，
+     * 原因写明是 shutdown 取消——保持事件存储自洽。
+     *
+     * <p>顺序：等待（至多 SHUTDOWN_GRACE）→ 对仍未完成者 cancel + 补终态事件 →
+     * 释放幂等键 → 清理。释放幂等键必须在最后，否则等待期间别的调用方可能抢到键
+     * 并启动新 workflow，而我们正要清空 executions。
      */
     @Override
     public void shutdown() {
-        executions.values().forEach(state -> {
+        long deadline = System.nanoTime() + SHUTDOWN_GRACE.toNanos();
+
+        // 1) 按契约等待在途执行自然完成（总预算 SHUTDOWN_GRACE，不是每个各等 30s）
+        for (WorkflowExecutionState state : executions.values()) {
+            java.util.concurrent.Future<?> result = state.handle.getResult();
+            if (result.isDone()) {
+                continue;
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                break;
+            }
+            try {
+                result.get(remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                break;   // 预算耗尽，余下的一并进入取消阶段
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (java.util.concurrent.ExecutionException | java.util.concurrent.CancellationException e) {
+                // 该 workflow 以失败/取消终结——已是终态，正常路径已写过事件
+            }
+        }
+
+        // 2) 仍未完成者：取消 + 补终态事件（否则事件存储里永远停在非终态）
+        executions.forEach((workflowId, state) -> {
             if (!state.handle.getResult().isDone()) {
                 state.handle.cancel();
+                try {
+                    eventStore.appendEvent(workflowId, WorkflowEvent.Type.WORKFLOW_FAILED,
+                            "cancelled by runtime shutdown after "
+                                    + SHUTDOWN_GRACE.toSeconds() + "s grace period");
+                } catch (RuntimeException e) {
+                    // 事件写入失败不得阻断关闭流程——但也不静默：其余资源仍需释放。
+                    LOGGER.log(System.Logger.Level.WARNING,
+                            "shutdown 补写终态事件失败 workflowId=" + workflowId, e);
+                }
             }
         });
+
+        // 3) 释放幂等键并清理（放最后：等待期间不能让别人抢到键启动新 workflow）
         executions.values().forEach(state -> {
             if (state.idempotencyKey != null) {
                 idempotencyManager.release(state.idempotencyKey);
@@ -181,7 +244,9 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
         });
         executions.clear();
         contexts.clear();
-        // 清理 ThreadLocal 避免内存泄漏
+        // ★只清除**调用线程自己**的 ThreadLocal 条目——其它线程的条目本方法够不着。
+        //   原注释「清理 ThreadLocal 避免内存泄漏」把范围说大了；真正的防线是
+        //   各执行线程在自己的 finally 里 remove（见 execute 路径）。
         threadLocalContext.remove();
     }
 
