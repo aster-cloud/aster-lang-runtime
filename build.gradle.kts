@@ -56,9 +56,22 @@ dependencies {
   implementation("jakarta.enterprise:jakarta.enterprise.cdi-api:4.0.1")
   implementation("jakarta.inject:jakarta.inject-api:2.0.1")
 
-  // 测试：保持与 core/truffle/validation 同版本（6.0.0），避免 BOM 漂移
-  testImplementation("org.junit.jupiter:junit-jupiter:6.0.0")
-  testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.13.4")
+  // 测试：版本交由 junit-bom 对齐，不写字面量（issue #45）。
+  //
+  // ★此前是 `junit-jupiter:6.0.0` + `junit-platform-launcher:1.13.4` —— **混代**：
+  //   1.13.x 属 JUnit 5.13 的平台线，JUnit 6 起平台构件已统一为 6.x。
+  //   而上一行注释还写着「避免 BOM 漂移」，与实际写法自相矛盾。
+  //
+  // ★更关键的是这两个字面量**根本没生效**：实测依赖树里
+  //     junit-jupiter:6.0.0            -> 6.1.0
+  //     junit-platform-launcher:1.13.4 -> 6.1.0
+  //   均被传递引入的 junit-bom:6.1.0 覆盖。即写在这里的数字既不真实、
+  //   又会让读者以为版本是被"钉住"的——两头都误导。
+  //
+  // 处理：jupiter 走 catalog 别名（生态统一治理），launcher 不写版本
+  //（与 aster-lang-validation 同构），由 BOM 解析。
+  testImplementation(asterLibs.junit.jupiter)
+  testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 tasks.test {
