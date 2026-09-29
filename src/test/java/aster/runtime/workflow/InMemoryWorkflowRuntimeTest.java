@@ -258,6 +258,28 @@ class InMemoryWorkflowRuntimeTest {
   }
 
   @Test
+  void duplicateWorkflowIdIsRejectedAndOriginalExecutionKeptIntact() {
+    // 审计 #55：重复调度同一 workflowId 此前静默覆盖，旧句柄永不完成、事件被重置回 READY。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle first = runtime.schedule("wf-dup", null, new WorkflowMetadata());
+
+    IllegalStateException ex = assertThrows(IllegalStateException.class,
+        () -> runtime.schedule("wf-dup", null, new WorkflowMetadata()));
+    assertTrue(ex.getMessage().contains("wf-dup"), ex.getMessage());
+    // 带幂等键的重复调度同样被拒绝，且不得释放/扰动任何键。
+    assertThrows(IllegalStateException.class,
+        () -> runtime.schedule("wf-dup", "key-dup", new WorkflowMetadata()));
+
+    assertEquals(1, runtime.getEventStore().getEvents("wf-dup", 0).size(),
+        "rejected schedule must not append a second WORKFLOW_STARTED");
+
+    runtime.completeWorkflow("wf-dup", "done");
+    assertTrue(first.getResult().isDone(), "original handle must still be completed");
+    assertEquals(WorkflowState.Status.COMPLETED,
+        runtime.getEventStore().getState("wf-dup").orElseThrow().getStatus());
+  }
+
+  @Test
   void abandonedIdempotencyKeyIsRejectedAfterBoundedWait() {
     // 键被一个从未登记执行状态的占用者长期持有（例如进程重启后缓存残留）：
     // 等待上限到期后必须拒绝启动，而不是无限等待，也不是启动重复 workflow。

@@ -58,21 +58,25 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
         InMemoryExecutionHandle handle = new InMemoryExecutionHandle(workflowId, resultFuture);
         WorkflowExecutionState state = new WorkflowExecutionState(handle, metadata, idempotencyKey);
 
-        if (idempotencyKey != null) {
-            // 关键：在幂等键“可见”之前，先把自己的执行状态登记到 executions（以自己的
-            // workflowId 为键）。这样任何并发的败者在 tryAcquire 解析出 winner 的 workflowId 后，
-            // executions.get(winnerWorkflowId) 必然非空，从而彻底关闭 TOCTOU 窗口——
-            // 消除“败者看到 state==null → 释放 winner 的键并启动自己的 workflow”这一竞态。
-            executions.put(workflowId, state);
+        // workflowId 是执行状态的唯一所有权凭证：重复调度同一 id 若静默覆盖，旧句柄的
+        // Future 永远不会完成（completeWorkflow 只认新条目），事件存储还会被第二条
+        // WORKFLOW_STARTED 重置回 READY。这类误用必须立刻可见，而不是变成静默挂起。
+        if (executions.putIfAbsent(workflowId, state) != null) {
+            throw new IllegalStateException(
+                    "Workflow '" + workflowId + "' is already scheduled; refusing to overwrite its execution state");
+        }
 
+        if (idempotencyKey != null) {
+            // 关键：上面的登记必须发生在幂等键“可见”之前。这样任何并发的败者在 tryAcquire
+            // 解析出 winner 的 workflowId 后，executions.get(winnerWorkflowId) 必然非空，
+            // 从而彻底关闭 TOCTOU 窗口——消除“败者看到 state==null → 释放 winner 的键并
+            // 启动自己的 workflow”这一竞态。
             ExecutionHandle deduped = acquireOrDedupe(workflowId, idempotencyKey, state);
             if (deduped != null) {
                 // 该幂等键已被一个存活的 workflow 占用：直接复用其句柄，绝不启动第二个。
                 return deduped;
             }
             // 否则：我们赢得了该键（state 已登记），继续走下去，保证“恰好启动一次”。
-        } else {
-            executions.put(workflowId, state);
         }
 
         // 为每个 workflow 创建独立的 DeterminismContext。
