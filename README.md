@@ -13,7 +13,7 @@
 - **Primitives / Builtins** -- 内置函数与基本类型支持
 - **Fn0 ~ Fn4** -- 函数式接口（0 到 4 参数）
 - **Interop / Async** -- 互操作与异步支持
-- **AsterCapability / AsterOrigin / AsterPii** -- 能力标记与数据分类注解
+- **AsterCapability / AsterOrigin** -- 能力标记与数据来源注解
 
 ### 工作流引擎 (`aster.runtime.workflow` / `io.aster.workflow`)
 
@@ -34,8 +34,7 @@
 
 ## 依赖
 
-- Quarkus 3.30.2（BOM 管理）
-- Quarkus Cache / Core
+- Quarkus Cache / Core（版本以 `build.gradle.kts` 中 `enforcedPlatform("io.quarkus.platform:quarkus-bom:…")` 为准，与 aster-api 对齐）
 - SmallRye Common Net（CidrAddress 支持）
 - Jakarta CDI 4.0.1 / Jakarta Inject 2.0.1
 
