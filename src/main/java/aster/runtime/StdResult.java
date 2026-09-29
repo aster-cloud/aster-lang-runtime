@@ -108,7 +108,12 @@ public final class StdResult {
     if (isOkMap(result)) {
       return readMapPayload((Map<?, ?>) result);
     }
-    throw new RuntimeException("Result.unwrap: called on Err");
+    // 只有确认是 Err 才说「called on Err」；非 Result 输入是类型错误，
+    // 必须与 mapOk/mapErr 的诊断一致，否则会把调用方引向错误的排查方向。
+    if (result instanceof Err<?, ?> || isErrMap(result)) {
+      throw new RuntimeException("Result.unwrap: called on Err");
+    }
+    throw new RuntimeException("Result.unwrap: expected Result (Ok or Err), got " + typeName(result));
   }
 
   /** 解包 Err 值。*/
@@ -119,7 +124,10 @@ public final class StdResult {
     if (isErrMap(result)) {
       return readMapPayload((Map<?, ?>) result);
     }
-    throw new RuntimeException("Result.unwrapErr: called on Ok");
+    if (result instanceof Ok<?, ?> || isOkMap(result)) {
+      throw new RuntimeException("Result.unwrapErr: called on Ok");
+    }
+    throw new RuntimeException("Result.unwrapErr: expected Result (Ok or Err), got " + typeName(result));
   }
 
   private static boolean isOkMap(Object value) {

@@ -54,6 +54,35 @@ class StdResultTest {
   }
 
   @Test
+  void unwrapReportsTypeErrorForNonResultInput() {
+    // 审计 #58：非 Result 输入此前被报成「called on Err/Ok」，与 mapOk/mapErr 的诊断不一致。
+    RuntimeException onInt = assertThrows(RuntimeException.class, () -> StdResult.unwrap(42));
+    assertEquals("Result.unwrap: expected Result (Ok or Err), got java.lang.Integer", onInt.getMessage());
+    RuntimeException onNull = assertThrows(RuntimeException.class, () -> StdResult.unwrap(null));
+    assertEquals("Result.unwrap: expected Result (Ok or Err), got null", onNull.getMessage());
+    RuntimeException untagged = assertThrows(RuntimeException.class, () -> StdResult.unwrap(new HashMap<>()));
+    assertEquals("Result.unwrap: expected Result (Ok or Err), got java.util.HashMap", untagged.getMessage());
+
+    RuntimeException onErr = assertThrows(RuntimeException.class, () -> StdResult.unwrap(StdResult.errMap("x")));
+    assertEquals("Result.unwrap: called on Err", onErr.getMessage());
+    RuntimeException onErrRecord = assertThrows(RuntimeException.class, () -> StdResult.unwrap(new Err<>("x")));
+    assertEquals("Result.unwrap: called on Err", onErrRecord.getMessage());
+  }
+
+  @Test
+  void unwrapErrReportsTypeErrorForNonResultInput() {
+    RuntimeException onStr = assertThrows(RuntimeException.class, () -> StdResult.unwrapErr("nope"));
+    assertEquals("Result.unwrapErr: expected Result (Ok or Err), got java.lang.String", onStr.getMessage());
+    RuntimeException onNull = assertThrows(RuntimeException.class, () -> StdResult.unwrapErr(null));
+    assertEquals("Result.unwrapErr: expected Result (Ok or Err), got null", onNull.getMessage());
+
+    RuntimeException onOk = assertThrows(RuntimeException.class, () -> StdResult.unwrapErr(StdResult.okMap(1)));
+    assertEquals("Result.unwrapErr: called on Ok", onOk.getMessage());
+    RuntimeException onOkRecord = assertThrows(RuntimeException.class, () -> StdResult.unwrapErr(new Ok<>(1)));
+    assertEquals("Result.unwrapErr: called on Ok", onOkRecord.getMessage());
+  }
+
+  @Test
   void mapOkAppliesFnOnOkBranch() {
     Map<Object, Object> ok = StdResult.okMap(5);
     Fn1<Object, Object> doubleIt = x -> ((Integer) x) * 2;
