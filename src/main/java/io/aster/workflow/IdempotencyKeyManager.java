@@ -122,7 +122,11 @@ public class IdempotencyKeyManager {
      * 提供显式清空口，让调用方（如测试、租户重置）能一次性回收。
      */
     public void clear() {
-        if (fallbackCache != null) {
+        // 与 release 同构：两种部署形态都必须真正清空键，否则 CDI 形态下 clear 是空操作，
+        // 租户重置/测试重置后旧键仍占用，后续 tryAcquire 一律被判「已被占用」。
+        if (cache != null) {
+            cache.invalidateAll().await().indefinitely();
+        } else {
             fallbackCache.clear();
         }
         keyLocks.clear();
