@@ -5,7 +5,9 @@ import io.aster.workflow.IdempotencyKeyManager;
 import jakarta.inject.Inject;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -272,8 +274,13 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param result 执行结果
      */
     public void completeWorkflow(String workflowId, Object result) {
+        // Map 结果在进入终态锁之前先做快照：事件存储在锁内会对 Map 做防御性拷贝，
+        // 若该 Map 正被调用方的其它线程修改，拷贝会抛 ConcurrentModificationException，
+        // 把用户对象的行为带进“条目已移除、键已释放”的不可逆区间。快照失败发生在任何
+        // 状态变更之前，workflow 仍然存活、可重试；锁内则只触碰运行时自己的对象。
+        Object payload = result instanceof Map<?, ?> map ? new LinkedHashMap<>(map) : result;
         WorkflowExecutionState state =
-                transitionToTerminal(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, result);
+                transitionToTerminal(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, payload);
         if (state != null) {
             state.handle.complete(result);
         }
@@ -286,6 +293,9 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param error 失败原因
      */
     public void failWorkflow(String workflowId, Throwable error) {
+        // 必须在任何状态变更之前拒绝 null：CompletableFuture.completeExceptionally(null) 抛 NPE，
+        // 若终态事件已写入、幂等键已释放，句柄将永远无法完成，且重试 fail 会被终态判定忽略。
+        Objects.requireNonNull(error, "error");
         // 持久化非空的失败原因：error.getMessage() 对很多异常为 null。
         // 记录完整的 throwable 类名 + message 链，便于回放与排障。
         WorkflowExecutionState state =
@@ -308,21 +318,36 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * 完成句柄，回调里用同一幂等键调度下一轮 workflow 就会看到“键被占用但无存活状态”，
      * 而 release 永远要等回调返回才发生——确定性死路。先释放、后回调，回调即可立即胜出。
      *
+     * <p>追加终态事件本身抛出异常时，executions 条目已移除、幂等键已释放，调用方拿不到
+     * state，再没有任何路径能完成句柄——等待方会永久挂起，重试 complete/fail 也只会写入
+     * 事件而摸不到句柄。因此这条失败路径由本方法自己把异常传给句柄，然后原样重抛；
+     * 句柄完成同样发生在锁外、释放键之后，与正常路径遵守同一顺序。释放放在 finally
+     * 且捕获 {@link Throwable}：事件存储若经 sneaky-throw 或 Kotlin 抛出受检异常，同样不得跳过释放。
+     *
      * @return 被移除的执行状态（调用方据此完成句柄）；已处于终态或无执行状态时为 {@code null}
      */
     private WorkflowExecutionState transitionToTerminal(String workflowId, String eventType, Object payload) {
-        synchronized (terminalLock(workflowId)) {
-            if (isTerminal(workflowId)) {
-                return null;
+        WorkflowExecutionState state = null;
+        try {
+            synchronized (terminalLock(workflowId)) {
+                if (isTerminal(workflowId)) {
+                    return null;
+                }
+                state = executions.remove(workflowId);
+                try {
+                    eventStore.appendEvent(workflowId, eventType, payload);
+                } finally {
+                    releaseTerminalResources(workflowId, state);
+                }
             }
-            WorkflowExecutionState state = executions.remove(workflowId);
-            try {
-                eventStore.appendEvent(workflowId, eventType, payload);
-            } finally {
-                releaseTerminalResources(workflowId, state);
+        } catch (Throwable t) {
+            // 已出锁、键已释放：与正常路径同序完成句柄，再以原始类型重抛（Java 7 精确重抛）。
+            if (state != null) {
+                state.handle.fail(t);
             }
-            return state;
+            throw t;
         }
+        return state;
     }
 
     /**
@@ -358,9 +383,6 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * 将异常链构造为非空的可读字符串：类名 + message，逐级追加 cause。
      */
     private static String describeThrowable(Throwable error) {
-        if (error == null) {
-            return "null";
-        }
         StringBuilder sb = new StringBuilder();
         Throwable t = error;
         java.util.Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
