@@ -58,21 +58,25 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
         InMemoryExecutionHandle handle = new InMemoryExecutionHandle(workflowId, resultFuture);
         WorkflowExecutionState state = new WorkflowExecutionState(handle, metadata, idempotencyKey);
 
-        if (idempotencyKey != null) {
-            // 关键：在幂等键“可见”之前，先把自己的执行状态登记到 executions（以自己的
-            // workflowId 为键）。这样任何并发的败者在 tryAcquire 解析出 winner 的 workflowId 后，
-            // executions.get(winnerWorkflowId) 必然非空，从而彻底关闭 TOCTOU 窗口——
-            // 消除“败者看到 state==null → 释放 winner 的键并启动自己的 workflow”这一竞态。
-            executions.put(workflowId, state);
+        // workflowId 是执行状态的唯一所有权凭证：重复调度同一 id 若静默覆盖，旧句柄的
+        // Future 永远不会完成（completeWorkflow 只认新条目），事件存储还会被第二条
+        // WORKFLOW_STARTED 重置回 READY。这类误用必须立刻可见，而不是变成静默挂起。
+        if (executions.putIfAbsent(workflowId, state) != null) {
+            throw new IllegalStateException(
+                    "Workflow '" + workflowId + "' is already scheduled; refusing to overwrite its execution state");
+        }
 
+        if (idempotencyKey != null) {
+            // 关键：上面的登记必须发生在幂等键“可见”之前。这样任何并发的败者在 tryAcquire
+            // 解析出 winner 的 workflowId 后，executions.get(winnerWorkflowId) 必然非空，
+            // 从而彻底关闭 TOCTOU 窗口——消除“败者看到 state==null → 释放 winner 的键并
+            // 启动自己的 workflow”这一竞态。
             ExecutionHandle deduped = acquireOrDedupe(workflowId, idempotencyKey, state);
             if (deduped != null) {
                 // 该幂等键已被一个存活的 workflow 占用：直接复用其句柄，绝不启动第二个。
                 return deduped;
             }
             // 否则：我们赢得了该键（state 已登记），继续走下去，保证“恰好启动一次”。
-        } else {
-            executions.put(workflowId, state);
         }
 
         // 为每个 workflow 创建独立的 DeterminismContext。
@@ -101,11 +105,12 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      */
     private ExecutionHandle acquireOrDedupe(String workflowId, String idempotencyKey,
                                             WorkflowExecutionState ownState) {
-        // 有界自旋：唯一会出现“键被占用但 state 为 null”的瞬态，是某个占用者已经完成、
-        // 正处于 executions.remove(...) 与幂等键 release 之间的极短窗口。自旋等待其 release
-        // 落地后，本次 tryAcquire 便会胜出，从而恰好启动一次；不会误启动重复 workflow。
-        final int maxSpins = 10_000;
-        for (int spins = 0; ; spins++) {
+        // 有界等待：唯一会出现“键被占用但 state 为 null”的瞬态，是某个占用者正处于终态转移
+        // 的锁内——executions.remove(...) 与幂等键 release 之间。该区间只做事件追加与资源
+        // 释放，不运行任何用户回调（回调在锁外、release 之后才触发），因此用时间而非自旋
+        // 次数来界定：自旋次数随 CPU/负载漂移，时间上限才是可靠的“窗口已过”判据。
+        final long deadline = System.nanoTime() + DEDUPE_WAIT.toNanos();
+        while (true) {
             Optional<String> existing = idempotencyManager.tryAcquire(
                     idempotencyKey, workflowId, Duration.ofHours(1));
             if (existing.isEmpty() || workflowId.equals(existing.get())) {
@@ -119,7 +124,7 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
                 executions.remove(workflowId, ownState);
                 return holder.handle;
             }
-            if (spins >= maxSpins) {
+            if (System.nanoTime() - deadline >= 0) {
                 // 病态情形：键被长期占用却无存活状态。拒绝启动重复 workflow。
                 executions.remove(workflowId, ownState);
                 throw new IllegalStateException(
@@ -129,6 +134,16 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
             Thread.onSpinWait();
         }
     }
+
+    /**
+     * 等待幂等键占用者完成 release 的时间上限。
+     *
+     * <p>可用系统属性 {@code aster.workflow.dedupeWaitMillis} 覆盖：正常情况下窗口远小于
+     * 1 毫秒，1 秒是留给调试器暂停、GC 停顿等异常停滞的余量；测试需要更短的值才能在
+     * 秒级内验证“键被遗弃时拒绝启动”这条路径。
+     */
+    static final Duration DEDUPE_WAIT = Duration.ofMillis(
+            Long.getLong("aster.workflow.dedupeWaitMillis", 1_000L));
 
     /**
      * 获取当前线程的确定性上下文（ThreadLocal 隔离）。
@@ -257,23 +272,10 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param result 执行结果
      */
     public void completeWorkflow(String workflowId, Object result) {
-        // 终态转移必须原子：per-workflow 锁使“检查是否终态 + 追加终态事件”不可分割，
-        // 避免与并发 failWorkflow 交错造成 COMPLETED/FAILED 分叉。
-        synchronized (terminalLock(workflowId)) {
-            // 由当前状态决定是否记录终态事件，而非依赖 executions 是否存在条目。
-            // 这样即使执行状态已被先前的调用清理（例如迟到的 complete），仍能写入终态事件。
-            if (isTerminal(workflowId)) {
-                return;
-            }
-            WorkflowExecutionState state = executions.remove(workflowId);
-            try {
-                if (state != null) {
-                    state.handle.complete(result);
-                }
-                eventStore.appendEvent(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, result);
-            } finally {
-                releaseTerminalResources(workflowId, state);
-            }
+        WorkflowExecutionState state =
+                transitionToTerminal(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, result);
+        if (state != null) {
+            state.handle.complete(result);
         }
     }
 
@@ -284,22 +286,42 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param error 失败原因
      */
     public void failWorkflow(String workflowId, Throwable error) {
-        // 与 completeWorkflow 对称：同一把 per-workflow 锁，使终态转移原子化。
+        // 持久化非空的失败原因：error.getMessage() 对很多异常为 null。
+        // 记录完整的 throwable 类名 + message 链，便于回放与排障。
+        WorkflowExecutionState state =
+                transitionToTerminal(workflowId, WorkflowEvent.Type.WORKFLOW_FAILED, describeThrowable(error));
+        if (state != null) {
+            state.handle.fail(error);
+        }
+    }
+
+    /**
+     * 原子地把 workflow 转入终态：追加终态事件并释放其全部资源（含幂等键）。
+     *
+     * <p>per-workflow 锁使“检查是否终态 + 追加终态事件”不可分割，避免与并发的
+     * complete/fail 交错造成 COMPLETED/FAILED 分叉。是否记录终态事件由事件存储的当前
+     * 状态决定，而非 executions 是否存在条目——即使执行状态已被先前的调用清理
+     * （例如迟到的 complete），仍能写入终态事件。
+     *
+     * <p>句柄的完成<b>不在此处</b>触发，而是由调用方在锁外、本方法返回之后执行。
+     * {@code CompletableFuture} 的依赖回调会在完成线程内同步运行；若在释放幂等键之前
+     * 完成句柄，回调里用同一幂等键调度下一轮 workflow 就会看到“键被占用但无存活状态”，
+     * 而 release 永远要等回调返回才发生——确定性死路。先释放、后回调，回调即可立即胜出。
+     *
+     * @return 被移除的执行状态（调用方据此完成句柄）；已处于终态或无执行状态时为 {@code null}
+     */
+    private WorkflowExecutionState transitionToTerminal(String workflowId, String eventType, Object payload) {
         synchronized (terminalLock(workflowId)) {
             if (isTerminal(workflowId)) {
-                return;
+                return null;
             }
             WorkflowExecutionState state = executions.remove(workflowId);
             try {
-                if (state != null) {
-                    state.handle.fail(error);
-                }
-                // 持久化非空的失败原因：error.getMessage() 对很多异常为 null。
-                // 改为记录完整的 throwable 类名 + message 链，便于回放与排障。
-                eventStore.appendEvent(workflowId, WorkflowEvent.Type.WORKFLOW_FAILED, describeThrowable(error));
+                eventStore.appendEvent(workflowId, eventType, payload);
             } finally {
                 releaseTerminalResources(workflowId, state);
             }
+            return state;
         }
     }
 

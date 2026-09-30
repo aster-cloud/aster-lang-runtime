@@ -157,4 +157,59 @@ class IdempotencyKeyManagerTest {
     assertTrue(mgr.tryAcquire("key-1", "wf-2", Duration.ofHours(1)).isEmpty(),
         "after release a new owner can acquire freshly");
   }
+
+  @Test
+  void clearInvalidatesQuarkusCacheInCdiMode() {
+    // 审计 #56：CDI 构造时 fallbackCache 为 null，此前 clear() 只清锁条、cache 中的键原样保留，
+    // 与 javadoc「清空全部幂等键」不符——重置后旧键仍占用，新 owner 被判「已被占用」。
+    MapBackedCache cache = new MapBackedCache();
+    IdempotencyKeyManager mgr = new IdempotencyKeyManager(cache);
+    assertTrue(mgr.tryAcquire("key-1", "wf-1", Duration.ofHours(1)).isEmpty());
+    assertTrue(mgr.tryAcquire("key-2", "wf-2", Duration.ofHours(1)).isEmpty());
+    assertEquals(2, cache.entries.size(), "前置条件：两个键均已写入 cache");
+
+    mgr.clear();
+
+    assertTrue(cache.entries.isEmpty(), "clear 必须清空 Quarkus cache 中的全部键");
+    assertTrue(mgr.tryAcquire("key-1", "wf-9", Duration.ofHours(1)).isEmpty(),
+        "clear 后新 owner 必须能重新获得键");
+  }
+
+  /** 以并发 Map 模拟 Quarkus Cache：只实现 tryAcquire/release/clear 用到的原子语义。 */
+  private static final class MapBackedCache implements io.quarkus.cache.Cache {
+    final java.util.concurrent.ConcurrentHashMap<Object, Object> entries =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    @Override public String getName() { return "idempotency-keys"; }
+    @Override public Object getDefaultKey() { return null; }
+
+    @Override @SuppressWarnings("unchecked")
+    public <K, V> io.smallrye.mutiny.Uni<V> get(K key, java.util.function.Function<K, V> loader) {
+      return io.smallrye.mutiny.Uni.createFrom().item(
+          (V) entries.computeIfAbsent(key, k -> loader.apply((K) k)));
+    }
+
+    @Override
+    public <K, V> io.smallrye.mutiny.Uni<V> getAsync(K key,
+        java.util.function.Function<K, io.smallrye.mutiny.Uni<V>> loader) {
+      return get(key, k -> loader.apply(k).await().indefinitely());
+    }
+
+    @Override public io.smallrye.mutiny.Uni<Void> invalidate(Object key) {
+      entries.remove(key);
+      return io.smallrye.mutiny.Uni.createFrom().voidItem();
+    }
+
+    @Override public io.smallrye.mutiny.Uni<Void> invalidateAll() {
+      entries.clear();
+      return io.smallrye.mutiny.Uni.createFrom().voidItem();
+    }
+
+    @Override public io.smallrye.mutiny.Uni<Void> invalidateIf(java.util.function.Predicate<Object> predicate) {
+      entries.keySet().removeIf(predicate);
+      return io.smallrye.mutiny.Uni.createFrom().voidItem();
+    }
+
+    @Override public <T extends io.quarkus.cache.Cache> T as(Class<T> type) { return type.cast(this); }
+  }
 }

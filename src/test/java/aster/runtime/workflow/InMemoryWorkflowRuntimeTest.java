@@ -221,6 +221,87 @@ class InMemoryWorkflowRuntimeTest {
   }
 
   @Test
+  void rescheduleWithSameIdempotencyKeyFromCompletionCallbackStartsNextRound() throws Exception {
+    // 审计 #54：链式 workflow 最常见的写法——在上一轮 getResult().thenAccept 里用同一幂等键
+    // 调度下一轮。回调在完成线程内同步运行；若句柄在幂等键释放之前完成，回调必然看到
+    // “键被 wf-A 占用但无存活状态”并确定性抛 IllegalStateException（且被 Future 吞掉）。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle first = runtime.schedule("wf-A", "key-1", new WorkflowMetadata());
+    java.util.concurrent.CompletableFuture<ExecutionHandle> next = first.getResult()
+        .thenApply(r -> runtime.schedule("wf-B", "key-1", new WorkflowMetadata()));
+
+    runtime.completeWorkflow("wf-A", "done");
+
+    ExecutionHandle second = next.get(5, TimeUnit.SECONDS);
+    assertEquals("wf-B", second.getWorkflowId(), "next round must start under its own workflowId");
+    assertEquals(WorkflowState.Status.READY,
+        runtime.getEventStore().getState("wf-B").orElseThrow().getStatus(),
+        "next round must have appended WORKFLOW_STARTED");
+    assertEquals(WorkflowState.Status.COMPLETED,
+        runtime.getEventStore().getState("wf-A").orElseThrow().getStatus());
+  }
+
+  @Test
+  void rescheduleWithSameIdempotencyKeyFromFailureCallbackStartsNextRound() throws Exception {
+    // 与 complete 对称：失败回调（例如重试）里用同一幂等键重新调度也必须能立即胜出。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle first = runtime.schedule("wf-A", "key-1", new WorkflowMetadata());
+    java.util.concurrent.CompletableFuture<ExecutionHandle> retry = first.getResult()
+        .handle((r, e) -> runtime.schedule("wf-A-retry", "key-1", new WorkflowMetadata()));
+
+    runtime.failWorkflow("wf-A", new RuntimeException("boom"));
+
+    ExecutionHandle second = retry.get(5, TimeUnit.SECONDS);
+    assertEquals("wf-A-retry", second.getWorkflowId());
+    assertEquals(WorkflowState.Status.READY,
+        runtime.getEventStore().getState("wf-A-retry").orElseThrow().getStatus());
+  }
+
+  @Test
+  void duplicateWorkflowIdIsRejectedAndOriginalExecutionKeptIntact() {
+    // 审计 #55：重复调度同一 workflowId 此前静默覆盖，旧句柄永不完成、事件被重置回 READY。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle first = runtime.schedule("wf-dup", null, new WorkflowMetadata());
+
+    IllegalStateException ex = assertThrows(IllegalStateException.class,
+        () -> runtime.schedule("wf-dup", null, new WorkflowMetadata()));
+    assertTrue(ex.getMessage().contains("wf-dup"), ex.getMessage());
+    // 带幂等键的重复调度同样被拒绝，且不得释放/扰动任何键。
+    assertThrows(IllegalStateException.class,
+        () -> runtime.schedule("wf-dup", "key-dup", new WorkflowMetadata()));
+
+    assertEquals(1, runtime.getEventStore().getEvents("wf-dup", 0).size(),
+        "rejected schedule must not append a second WORKFLOW_STARTED");
+
+    runtime.completeWorkflow("wf-dup", "done");
+    assertTrue(first.getResult().isDone(), "original handle must still be completed");
+    assertEquals(WorkflowState.Status.COMPLETED,
+        runtime.getEventStore().getState("wf-dup").orElseThrow().getStatus());
+  }
+
+  @Test
+  void abandonedIdempotencyKeyIsRejectedAfterBoundedWait() {
+    // 键被一个从未登记执行状态的占用者长期持有（例如进程重启后缓存残留）：
+    // 等待上限到期后必须拒绝启动，而不是无限等待，也不是启动重复 workflow。
+    io.aster.workflow.IdempotencyKeyManager manager = new io.aster.workflow.IdempotencyKeyManager();
+    assertTrue(manager.tryAcquire("stale-key", "ghost", java.time.Duration.ofHours(1)).isEmpty());
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime(manager);
+
+    long start = System.nanoTime();
+    IllegalStateException ex = assertThrows(IllegalStateException.class,
+        () -> runtime.schedule("wf-new", "stale-key", new WorkflowMetadata()));
+    long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+    assertTrue(ex.getMessage().contains("ghost"), "message should name the holder: " + ex.getMessage());
+    assertTrue(elapsedMillis >= InMemoryWorkflowRuntime.DEDUPE_WAIT.toMillis(),
+        "must wait the full bounded window before giving up, waited " + elapsedMillis + "ms");
+    assertTrue(elapsedMillis < InMemoryWorkflowRuntime.DEDUPE_WAIT.toMillis() * 5,
+        "wait must be time-bounded, waited " + elapsedMillis + "ms");
+    assertTrue(runtime.getEventStore().getState("wf-new").isEmpty(),
+        "rejected schedule must not append WORKFLOW_STARTED");
+  }
+
+  @Test
   void determinismContextRunWithBindsAndClearsOnSameThread() {
     // 验证 #6 的安全原语：runWith 在当前线程绑定 per-workflow 实例，结束后复位。
     InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
