@@ -5,6 +5,7 @@ import io.aster.workflow.IdempotencyKeyManager;
 import jakarta.inject.Inject;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -272,8 +273,13 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param result 执行结果
      */
     public void completeWorkflow(String workflowId, Object result) {
+        // Map 结果在进入终态锁之前先做快照：事件存储在锁内会对 Map 做防御性拷贝，
+        // 若该 Map 正被调用方的其它线程修改，拷贝会抛 ConcurrentModificationException，
+        // 把用户对象的行为带进“条目已移除、键已释放”的不可逆区间。快照失败发生在任何
+        // 状态变更之前，workflow 仍然存活、可重试；锁内则只触碰运行时自己的对象。
+        Object payload = result instanceof Map<?, ?> map ? new LinkedHashMap<>(map) : result;
         WorkflowExecutionState state =
-                transitionToTerminal(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, result);
+                transitionToTerminal(workflowId, WorkflowEvent.Type.WORKFLOW_COMPLETED, payload);
         if (state != null) {
             state.handle.complete(result);
         }
@@ -308,6 +314,11 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * 完成句柄，回调里用同一幂等键调度下一轮 workflow 就会看到“键被占用但无存活状态”，
      * 而 release 永远要等回调返回才发生——确定性死路。先释放、后回调，回调即可立即胜出。
      *
+     * <p>唯一例外是追加终态事件本身抛出异常：此时 executions 条目已移除、幂等键已释放，
+     * 调用方拿不到 state，再没有任何路径能完成句柄——等待方会永久挂起，重试 complete/fail
+     * 也只会写入事件而摸不到句柄。因此这条失败路径必须在这里就把异常传给句柄，
+     * 同样遵守“先释放键、后完成句柄”的顺序，然后原样重抛。
+     *
      * @return 被移除的执行状态（调用方据此完成句柄）；已处于终态或无执行状态时为 {@code null}
      */
     private WorkflowExecutionState transitionToTerminal(String workflowId, String eventType, Object payload) {
@@ -318,9 +329,14 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
             WorkflowExecutionState state = executions.remove(workflowId);
             try {
                 eventStore.appendEvent(workflowId, eventType, payload);
-            } finally {
+            } catch (RuntimeException | Error e) {
                 releaseTerminalResources(workflowId, state);
+                if (state != null) {
+                    state.handle.fail(e);
+                }
+                throw e;
             }
+            releaseTerminalResources(workflowId, state);
             return state;
         }
     }

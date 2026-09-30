@@ -315,4 +315,64 @@ class InMemoryWorkflowRuntimeTest {
     assertSame(before, io.aster.workflow.ReplayDeterministicUuid.current(),
         "after runWith the previous binding must be restored on this thread");
   }
+
+  @Test
+  void terminalEventAppendFailureFailsHandleInsteadOfOrphaningIt() throws Exception {
+    // 审计 #60：终态事件追加抛异常时，executions 条目已移除、幂等键已释放，调用方拿不到
+    // state——此前句柄就此永久孤儿化。事件存储对 Throwable 结果会在锁内调用 getMessage()，
+    // 这里用一个 getMessage() 抛错的结果对象把异常制造在锁内。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle handle = runtime.schedule("wf-A", "key-1", new WorkflowMetadata());
+    RuntimeException boom = new IllegalStateException("simulated append failure");
+    Throwable hostileResult = new RuntimeException("result") {
+      @Override public String getMessage() { throw boom; }
+    };
+
+    RuntimeException thrown = assertThrows(RuntimeException.class,
+        () -> runtime.completeWorkflow("wf-A", hostileResult));
+    assertSame(boom, thrown, "the original failure must be rethrown unchanged");
+
+    assertTrue(handle.getResult().isCompletedExceptionally(),
+        "handle must be failed with the append failure, not left pending forever");
+    ExecutionException ee = assertThrows(ExecutionException.class,
+        () -> handle.getResult().get(1, TimeUnit.SECONDS));
+    assertSame(boom, ee.getCause());
+
+    // 键已释放且句柄已终结：同键可立即启动下一轮，而不是去重到一个永远不完成的句柄。
+    ExecutionHandle next = runtime.schedule("wf-B", "key-1", new WorkflowMetadata());
+    assertEquals("wf-B", next.getWorkflowId());
+  }
+
+  @Test
+  void mapResultIsSnapshottedBeforeTerminalTransition() throws Exception {
+    // 审计 #60（第二半）：Map 结果若在锁内做防御性拷贝时抛 ConcurrentModificationException，
+    // 会命中上面那条失败路径。先在锁外快照，则失败发生在任何状态变更之前：workflow 仍然
+    // 存活、键仍被持有、可以重试完成。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle handle = runtime.schedule("wf-A", "key-1", new WorkflowMetadata());
+    java.util.Map<String, Object> concurrentlyModified = new java.util.HashMap<>() {
+      @Override public java.util.Set<java.util.Map.Entry<String, Object>> entrySet() {
+        throw new java.util.ConcurrentModificationException("simulated");
+      }
+    };
+    // 拷贝构造只在 size()>0 时才遍历 entrySet()，空 Map 触发不了故障路径。
+    concurrentlyModified.put("k", "v");
+
+    assertThrows(java.util.ConcurrentModificationException.class,
+        () -> runtime.completeWorkflow("wf-A", concurrentlyModified));
+
+    assertTrue(!handle.getResult().isDone(), "workflow must still be live after a pre-lock snapshot failure");
+    assertEquals(WorkflowState.Status.READY,
+        runtime.getEventStore().getState("wf-A").orElseThrow().getStatus(),
+        "no terminal event may be written when the snapshot fails");
+    assertSame(handle, runtime.schedule("wf-B", "key-1", new WorkflowMetadata()),
+        "idempotency key must still be held by wf-A (dedupe to its handle)");
+
+    java.util.Map<String, Object> ok = new java.util.LinkedHashMap<>();
+    ok.put("answer", 42);
+    runtime.completeWorkflow("wf-A", ok);
+    assertSame(ok, handle.getResult().get(1, TimeUnit.SECONDS), "handle receives the caller's own result object");
+    assertEquals(ok, runtime.getEventStore().getState("wf-A").orElseThrow().getResult(),
+        "event store receives an equal snapshot of the result");
+  }
 }
