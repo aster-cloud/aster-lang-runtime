@@ -64,6 +64,32 @@ class InMemoryWorkflowRuntimeTest {
   }
 
   @Test
+  void failWorkflowWithNullErrorRejectsBeforeAnyStateChange() {
+    // 审计 #61：null 曾被 describeThrowable 接受并写入 FAILED 终态，随后 handle.fail(null) 抛 NPE，
+    // 句柄永久孤儿化且重试被终态判定忽略。现在必须在任何状态变更之前拒绝。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle handle = runtime.schedule("wf-null", "key-null", new WorkflowMetadata());
+    WorkflowState before = runtime.getEventStore().getState("wf-null").orElseThrow();
+    int eventsBefore = runtime.getEventStore().getEvents("wf-null", 0).size();
+
+    assertThrows(NullPointerException.class, () -> runtime.failWorkflow("wf-null", null));
+
+    WorkflowState after = runtime.getEventStore().getState("wf-null").orElseThrow();
+    assertEquals(before.getStatus(), after.getStatus(), "status must be untouched");
+    assertEquals(before.getLastEventSeq(), after.getLastEventSeq(), "no event may be appended");
+    assertEquals(eventsBefore, runtime.getEventStore().getEvents("wf-null", 0).size());
+    assertTrue(!handle.getResult().isDone(), "handle must remain pending");
+
+    // 执行状态与幂等键均未被拆除：随后的真实失败必须正常终结句柄。
+    RuntimeException real = new RuntimeException("real");
+    runtime.failWorkflow("wf-null", real);
+    assertEquals(WorkflowState.Status.FAILED,
+        runtime.getEventStore().getState("wf-null").orElseThrow().getStatus());
+    ExecutionException ex = assertThrows(ExecutionException.class, () -> handle.getResult().get());
+    assertSame(real, ex.getCause());
+  }
+
+  @Test
   void terminalTransitionIsIdempotent() {
     InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
     runtime.schedule("wf-3", null, new WorkflowMetadata());

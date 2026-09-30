@@ -7,6 +7,7 @@ import jakarta.inject.Inject;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -292,6 +293,9 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * @param error 失败原因
      */
     public void failWorkflow(String workflowId, Throwable error) {
+        // 必须在任何状态变更之前拒绝 null：CompletableFuture.completeExceptionally(null) 抛 NPE，
+        // 若终态事件已写入、幂等键已释放，句柄将永远无法完成，且重试 fail 会被终态判定忽略。
+        Objects.requireNonNull(error, "error");
         // 持久化非空的失败原因：error.getMessage() 对很多异常为 null。
         // 记录完整的 throwable 类名 + message 链，便于回放与排障。
         WorkflowExecutionState state =
@@ -374,9 +378,6 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * 将异常链构造为非空的可读字符串：类名 + message，逐级追加 cause。
      */
     private static String describeThrowable(Throwable error) {
-        if (error == null) {
-            return "null";
-        }
         StringBuilder sb = new StringBuilder();
         Throwable t = error;
         java.util.Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
