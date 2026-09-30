@@ -318,31 +318,36 @@ public class InMemoryWorkflowRuntime implements WorkflowRuntime {
      * 完成句柄，回调里用同一幂等键调度下一轮 workflow 就会看到“键被占用但无存活状态”，
      * 而 release 永远要等回调返回才发生——确定性死路。先释放、后回调，回调即可立即胜出。
      *
-     * <p>唯一例外是追加终态事件本身抛出异常：此时 executions 条目已移除、幂等键已释放，
-     * 调用方拿不到 state，再没有任何路径能完成句柄——等待方会永久挂起，重试 complete/fail
-     * 也只会写入事件而摸不到句柄。因此这条失败路径必须在这里就把异常传给句柄，
-     * 同样遵守“先释放键、后完成句柄”的顺序，然后原样重抛。
+     * <p>追加终态事件本身抛出异常时，executions 条目已移除、幂等键已释放，调用方拿不到
+     * state，再没有任何路径能完成句柄——等待方会永久挂起，重试 complete/fail 也只会写入
+     * 事件而摸不到句柄。因此这条失败路径由本方法自己把异常传给句柄，然后原样重抛；
+     * 句柄完成同样发生在锁外、释放键之后，与正常路径遵守同一顺序。释放放在 finally
+     * 且捕获 {@link Throwable}：事件存储若经 sneaky-throw 或 Kotlin 抛出受检异常，同样不得跳过释放。
      *
      * @return 被移除的执行状态（调用方据此完成句柄）；已处于终态或无执行状态时为 {@code null}
      */
     private WorkflowExecutionState transitionToTerminal(String workflowId, String eventType, Object payload) {
-        synchronized (terminalLock(workflowId)) {
-            if (isTerminal(workflowId)) {
-                return null;
-            }
-            WorkflowExecutionState state = executions.remove(workflowId);
-            try {
-                eventStore.appendEvent(workflowId, eventType, payload);
-            } catch (RuntimeException | Error e) {
-                releaseTerminalResources(workflowId, state);
-                if (state != null) {
-                    state.handle.fail(e);
+        WorkflowExecutionState state = null;
+        try {
+            synchronized (terminalLock(workflowId)) {
+                if (isTerminal(workflowId)) {
+                    return null;
                 }
-                throw e;
+                state = executions.remove(workflowId);
+                try {
+                    eventStore.appendEvent(workflowId, eventType, payload);
+                } finally {
+                    releaseTerminalResources(workflowId, state);
+                }
             }
-            releaseTerminalResources(workflowId, state);
-            return state;
+        } catch (Throwable t) {
+            // 已出锁、键已释放：与正常路径同序完成句柄，再以原始类型重抛（Java 7 精确重抛）。
+            if (state != null) {
+                state.handle.fail(t);
+            }
+            throw t;
         }
+        return state;
     }
 
     /**

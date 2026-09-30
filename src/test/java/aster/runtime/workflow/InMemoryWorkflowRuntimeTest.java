@@ -370,6 +370,37 @@ class InMemoryWorkflowRuntimeTest {
   }
 
   @Test
+  void terminalEventAppendCheckedThrowableStillReleasesKeyAndFailsHandle() throws Exception {
+    // 审计 #60 跟进：锁内曾只捕获 RuntimeException | Error，经 sneaky-throw（或 Kotlin）冒出的
+    // 受检异常会绕过释放与句柄终结。这里用 sneaky-throw 从 getMessage() 抛出 IOException。
+    InMemoryWorkflowRuntime runtime = new InMemoryWorkflowRuntime();
+    ExecutionHandle handle = runtime.schedule("wf-A", "key-1", new WorkflowMetadata());
+    java.io.IOException checked = new java.io.IOException("simulated checked append failure");
+    Throwable hostileResult = new RuntimeException("result") {
+      @Override public String getMessage() { throw sneaky(checked); }
+    };
+
+    Throwable thrown = assertThrows(Throwable.class,
+        () -> runtime.completeWorkflow("wf-A", hostileResult));
+    assertSame(checked, thrown, "the checked throwable must be rethrown unchanged, not wrapped");
+
+    assertTrue(handle.getResult().isCompletedExceptionally(),
+        "handle must be failed even when the append failure is not a RuntimeException");
+    ExecutionException ee = assertThrows(ExecutionException.class,
+        () -> handle.getResult().get(1, TimeUnit.SECONDS));
+    assertSame(checked, ee.getCause());
+
+    ExecutionHandle next = runtime.schedule("wf-B", "key-1", new WorkflowMetadata());
+    assertEquals("wf-B", next.getWorkflowId(), "idempotency key must have been released");
+  }
+
+  /** 以原始类型抛出任意 Throwable，绕过编译期受检检查（模拟 Kotlin / sneaky-throw 调用方）。 */
+  @SuppressWarnings("unchecked")
+  private static <T extends Throwable> RuntimeException sneaky(Throwable t) throws T {
+    throw (T) t;
+  }
+
+  @Test
   void mapResultIsSnapshottedBeforeTerminalTransition() throws Exception {
     // 审计 #60（第二半）：Map 结果若在锁内做防御性拷贝时抛 ConcurrentModificationException，
     // 会命中上面那条失败路径。先在锁外快照，则失败发生在任何状态变更之前：workflow 仍然
