@@ -10,6 +10,7 @@ import java.util.logging.Logger;
 
 /**
  * 可重放的确定性 UUID 生成器，完全复用 ReplayDeterministicClock 的状态机语义。
+ * 线程安全约定同 ReplayDeterministicClock：实例方法全部 synchronized。
  */
 public final class ReplayDeterministicUuid {
 
@@ -73,7 +74,7 @@ public final class ReplayDeterministicUuid {
      *
      * @return 确定性的 UUID
      */
-    public UUID randomUUID() {
+    public synchronized UUID randomUUID() {
         if (replayMode) {
             if (replayIndex >= recorded.size()) {
                 throw new IllegalStateException(
@@ -96,7 +97,7 @@ public final class ReplayDeterministicUuid {
      *
      * @return true 表示处于重放模式
      */
-    public boolean isReplayMode() {
+    public synchronized boolean isReplayMode() {
         return replayMode;
     }
 
@@ -105,7 +106,7 @@ public final class ReplayDeterministicUuid {
      *
      * @param uuids 记录的 UUID 序列
      */
-    public void enterReplayMode(List<UUID> uuids) {
+    public synchronized void enterReplayMode(List<UUID> uuids) {
         Objects.requireNonNull(uuids, "uuids");
         resetRecordingState();
 
@@ -130,7 +131,7 @@ public final class ReplayDeterministicUuid {
     /**
      * 退出重放模式，恢复记录模式并清空旧的决策。
      */
-    public void exitReplayMode() {
+    public synchronized void exitReplayMode() {
         this.replayMode = false;
         this.replayIndex = 0;
         this.recorded.clear();
@@ -142,7 +143,7 @@ public final class ReplayDeterministicUuid {
      *
      * @return recorded 的副本
      */
-    public List<UUID> getRecordedUuids() {
+    public synchronized List<UUID> getRecordedUuids() {
         return new ArrayList<>(recorded);
     }
 
@@ -155,7 +156,7 @@ public final class ReplayDeterministicUuid {
      *
      * @return true 表示记录已被截断
      */
-    public boolean isRecordLimitReached() {
+    public synchronized boolean isRecordLimitReached() {
         return recordLimitReached;
     }
 

@@ -14,6 +14,7 @@ import java.util.logging.Logger;
 
 /**
  * 可重放且具备 source 颗粒度的确定性随机数门面。
+ * 线程安全约定同 ReplayDeterministicClock：实例方法全部 synchronized。
  *
  * 该实现与 ReplayDeterministicUuid/Clock 共享状态机语义：
  * - 记录模式：调用 ThreadLocalRandom 生成值并以 source 为键进行录制；
@@ -84,7 +85,7 @@ public final class ReplayDeterministicRandom {
      * @param source 调用来源标识
      * @return 确定性的 int
      */
-    public int nextInt(String source) {
+    public synchronized int nextInt(String source) {
         return (int) nextLong(source);
     }
 
@@ -94,7 +95,7 @@ public final class ReplayDeterministicRandom {
      * @param source 调用来源标识
      * @return 确定性的 long
      */
-    public long nextLong(String source) {
+    public synchronized long nextLong(String source) {
         Objects.requireNonNull(source, "source");
 
         if (replayMode) {
@@ -118,7 +119,7 @@ public final class ReplayDeterministicRandom {
      * @param source 调用来源标识
      * @return [0,1) 区间内确定性的 double
      */
-    public double nextDouble(String source) {
+    public synchronized double nextDouble(String source) {
         long bits = nextLong(source);
         return (bits >>> 11) * 0x1.0p-53;
     }
@@ -128,7 +129,7 @@ public final class ReplayDeterministicRandom {
      *
      * @return true 表示正在重放
      */
-    public boolean isReplayMode() {
+    public synchronized boolean isReplayMode() {
         return replayMode;
     }
 
@@ -137,7 +138,7 @@ public final class ReplayDeterministicRandom {
      *
      * @param randoms source→随机序列
      */
-    public void enterReplayMode(Map<String, List<Long>> randoms) {
+    public synchronized void enterReplayMode(Map<String, List<Long>> randoms) {
         Objects.requireNonNull(randoms, "randoms");
         resetStateForReplay();
 
@@ -168,7 +169,7 @@ public final class ReplayDeterministicRandom {
     /**
      * 退出重放模式并清空旧的序列，以便重新录制。
      */
-    public void exitReplayMode() {
+    public synchronized void exitReplayMode() {
         this.replayMode = false;
         this.replayIndices.clear();
         this.limitWarnedSources.clear();
@@ -185,7 +186,7 @@ public final class ReplayDeterministicRandom {
      *
      * @return true 表示存在被截断的 source
      */
-    public boolean isRecordLimitReached() {
+    public synchronized boolean isRecordLimitReached() {
         return !truncatedSources.isEmpty();
     }
 
@@ -194,7 +195,7 @@ public final class ReplayDeterministicRandom {
      *
      * @return 被截断的 source 名称集合
      */
-    public Set<String> getTruncatedSources() {
+    public synchronized Set<String> getTruncatedSources() {
         return new HashSet<>(truncatedSources);
     }
 
@@ -203,7 +204,7 @@ public final class ReplayDeterministicRandom {
      *
      * @return source→随机序列
      */
-    public Map<String, List<Long>> getRecordedRandoms() {
+    public synchronized Map<String, List<Long>> getRecordedRandoms() {
         Map<String, List<Long>> copy = new LinkedHashMap<>();
         recorded.forEach((source, values) -> copy.put(source, new ArrayList<>(values)));
         return copy;

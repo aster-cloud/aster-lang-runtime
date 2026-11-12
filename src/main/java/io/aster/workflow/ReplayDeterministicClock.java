@@ -9,6 +9,10 @@ import java.util.List;
  *
  * 在正常执行时记录时间决策，在重放时返回记录的时间。
  * 这确保了 workflow 在重放时的行为与原始执行完全一致。
+ *
+ * <p>线程安全：实例方法全部 synchronized。同一个时钟会被多个线程并发调用（如 truffle
+ * AsyncTaskRegistry.scheduleRetry 从各 worker 调 now()），无锁的 ArrayList 追加会丢记录或抛
+ * ArrayIndexOutOfBoundsException。
  */
 public class ReplayDeterministicClock implements DeterministicClock {
 
@@ -25,7 +29,7 @@ public class ReplayDeterministicClock implements DeterministicClock {
      * @return 当前时间
      */
     @Override
-    public Instant now() {
+    public synchronized Instant now() {
         if (replayMode) {
             if (replayIndex >= recordedTimes.size()) {
                 throw new IllegalStateException(
@@ -49,7 +53,7 @@ public class ReplayDeterministicClock implements DeterministicClock {
      * @param instant 要记录的时间
      */
     @Override
-    public void recordTimeDecision(Instant instant) {
+    public synchronized void recordTimeDecision(Instant instant) {
         if (!replayMode) {
             recordedTimes.add(instant);
         }
@@ -61,7 +65,7 @@ public class ReplayDeterministicClock implements DeterministicClock {
      * @return true 如果在重放模式
      */
     @Override
-    public boolean isReplayMode() {
+    public synchronized boolean isReplayMode() {
         return replayMode;
     }
 
@@ -72,7 +76,7 @@ public class ReplayDeterministicClock implements DeterministicClock {
      *
      * @param times 记录的时间列表
      */
-    public void enterReplayMode(List<Instant> times) {
+    public synchronized void enterReplayMode(List<Instant> times) {
         this.recordedTimes.clear();
         this.recordedTimes.addAll(times);
         this.replayMode = true;
@@ -84,7 +88,7 @@ public class ReplayDeterministicClock implements DeterministicClock {
      *
      * 清空记录并恢复正常执行模式。
      */
-    public void exitReplayMode() {
+    public synchronized void exitReplayMode() {
         this.replayMode = false;
         this.replayIndex = 0;
         this.recordedTimes.clear();
@@ -95,7 +99,7 @@ public class ReplayDeterministicClock implements DeterministicClock {
      *
      * @return 时间列表的副本
      */
-    public List<Instant> getRecordedTimes() {
+    public synchronized List<Instant> getRecordedTimes() {
         return new ArrayList<>(recordedTimes);
     }
 
