@@ -17,8 +17,14 @@ publishing {
         create<MavenPublication>("mavenJava") {
             from(components["java"])
             artifactId = "aster-lang-runtime"
-            // 抑制 enforced platform 警告，因为这是内部发布
-            suppressAllPomMetadataWarnings()
+            // quarkus-bom 不进发布元数据（见下方 quarkusPlatform），直接依赖的版本改为
+            // 按本仓 runtimeClasspath 的实际解析结果写入 POM / Gradle module，
+            // 消费方拿到的是普通版本要求，可参与自身的冲突解析。
+            versionMapping {
+                allVariants {
+                    fromResolutionOf("runtimeClasspath")
+                }
+            }
         }
     }
     repositories {
@@ -33,15 +39,26 @@ publishing {
     }
 }
 
-tasks.withType<GenerateModuleMetadata> {
-    suppressedValidationErrors.add("enforced-platform")
-}
-
 java {
   toolchain { languageVersion.set(JavaLanguageVersion.of(25)) }
 }
 
 repositories { mavenCentral() }
+
+// quarkus-bom 只约束本仓自身的解析（编译 / 运行 / 测试 classpath），不进 apiElements /
+// runtimeElements，因而不会发布给消费方（aster-lang-runtime#90）。此前它挂在
+// implementation 上，发布元数据带 enforcedPlatform(quarkus-bom)，把消费方的
+// org.graalvm.sdk:graal-sdk / nativeimage / word 强制降到 23.1.2（truffle 用 25.x）。
+// 该配置既不可消费也不可解析，仅作为下列 classpath 的父配置。
+val quarkusPlatform: Configuration by configurations.creating {
+  isCanBeConsumed = false
+  isCanBeResolved = false
+}
+sourceSets.all {
+  listOf(compileClasspathConfigurationName, runtimeClasspathConfigurationName).forEach {
+    configurations.named(it) { extendsFrom(quarkusPlatform) }
+  }
+}
 
 dependencies {
   // R21-Major-5 / 审计 #32：与 aster-api 对齐 quarkus-bom，避免运行时库 BOM 漂移。
@@ -49,7 +66,7 @@ dependencies {
   // quarkus-cache/quarkus-core 按 3.32.2 编译测试、却在 aster-api 内解析为 3.37.0，
   // Quarkus 行为变更只会在 aster-api 暴露而本库 CI 全绿。对齐到 3.37.0 消除漂移。
   // （平台 catalog 已新增 asterLibs.quarkus.bom=3.37.0，catalog 发布后应迁移到别名。）
-  implementation(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.37.0"))
+  quarkusPlatform(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.37.0"))
   implementation("io.quarkus:quarkus-cache")
   implementation("io.quarkus:quarkus-core")
   implementation("io.smallrye.common:smallrye-common-net") // For CidrAddress (GraalVM substitutions)
@@ -81,3 +98,24 @@ tasks.test {
 tasks.withType<Jar> {
   duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
+
+// 防回归（#90）：发布的 POM / Gradle module 不得再带 quarkus-bom 或 enforced-platform，
+// 否则消费方的 GraalVM 等版本会被再次强制钉死。
+val checkPublishedMetadata = tasks.register("checkPublishedMetadata") {
+  description = "核对发布元数据未泄漏 quarkus-bom / enforced-platform"
+  group = "verification"
+  val pom = tasks.named<GenerateMavenPom>("generatePomFileForMavenJavaPublication")
+  val module = tasks.named<GenerateModuleMetadata>("generateMetadataFileForMavenJavaPublication")
+  dependsOn(pom, module)
+  val files = listOf(pom.map { it.destination }, module.flatMap { it.outputFile }.map { it.asFile })
+  doLast {
+    val leaks = files.map { it.get() }.flatMap { f ->
+      val text = f.readText()
+      listOf("quarkus-bom", "enforced-platform").filter { text.contains(it) }.map { "${f.name}: $it" }
+    }
+    if (leaks.isNotEmpty()) {
+      throw GradleException("发布元数据泄漏 BOM：\n" + leaks.joinToString("\n"))
+    }
+  }
+}
+tasks.named("check") { dependsOn(checkPublishedMetadata) }

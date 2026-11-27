@@ -36,7 +36,9 @@
 
 - Quarkus Cache / Core（版本以 `build.gradle.kts` 中 `enforcedPlatform("io.quarkus.platform:quarkus-bom:…")` 为准，与 aster-api 对齐）
 - SmallRye Common Net（CidrAddress 支持）
-- Jakarta CDI 4.0.1 / Jakarta Inject 2.0.1
+- Jakarta CDI / Jakarta Inject
+
+quarkus-bom 只约束本仓自身的构建，不写入发布的 POM / Gradle module：发布元数据里是各直接依赖按本仓解析结果写入的普通版本，消费方自行决定 Quarkus 与 GraalVM 版本（#90）。`./gradlew check` 中的 `checkPublishedMetadata` 防止 BOM 再次泄漏。
 
 ## 构建
 
