@@ -75,7 +75,7 @@ dependencies {
   //   checkConsumableVersions 守门：版本缺失或与本仓 BOM 解析结果不一致即失败，升级 BOM 时随之更新。
   implementation("io.quarkus:quarkus-cache:3.37.0")
   implementation("io.quarkus:quarkus-core:3.37.0")
-  implementation("io.smallrye.common:smallrye-common-net:2.18.1") // For CidrAddress (GraalVM substitutions)
+  implementation("io.smallrye.common:smallrye-common-net:2.18.1") // CidrAddress（GraalVM 替换类使用）
   implementation("jakarta.enterprise:jakarta.enterprise.cdi-api:4.1.0")
   implementation("jakarta.inject:jakarta.inject-api:2.0.1")
 
@@ -150,8 +150,8 @@ val checkConsumableVersions = tasks.register("checkConsumableVersions") {
     val problems = declared.get().mapNotNull { (variant, module, version) ->
       when {
         version.isBlank() -> "$variant: $module 未写版本"
-        actual[module] != null && actual[module] != version ->
-          "$variant: $module 声明 $version，本仓解析为 ${actual[module]}"
+        actual[module] == null -> "$variant: $module 未出现在本仓 runtimeClasspath 的直接依赖中"
+        actual[module] != version -> "$variant: $module 声明 $version，本仓解析为 ${actual[module]}"
         else -> null
       }
     }
