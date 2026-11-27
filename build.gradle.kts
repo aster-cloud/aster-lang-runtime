@@ -67,10 +67,16 @@ dependencies {
   // Quarkus 行为变更只会在 aster-api 暴露而本库 CI 全绿。对齐到 3.37.0 消除漂移。
   // （平台 catalog 已新增 asterLibs.quarkus.bom=3.37.0，catalog 发布后应迁移到别名。）
   quarkusPlatform(enforcedPlatform("io.quarkus.platform:quarkus-bom:3.37.0"))
-  implementation("io.quarkus:quarkus-cache")
-  implementation("io.quarkus:quarkus-core")
-  implementation("io.smallrye.common:smallrye-common-net") // For CidrAddress (GraalVM substitutions)
-  implementation("jakarta.enterprise:jakarta.enterprise.cdi-api:4.0.1")
+  //
+  // ★直接依赖必须写明版本（取 quarkus-bom 3.37.0 中的值）：BOM 只在私有的 quarkusPlatform 上，
+  //   不进 apiElements / runtimeElements。经 includeBuild 源码引用本仓的消费方（aster-api 的
+  //   replay / runner）看到的是项目变体里的声明，versionMapping 只改发布的 POM / module，
+  //   不写版本即解析失败（Could not find io.quarkus:quarkus-cache:.）。
+  //   checkConsumableVersions 守门：版本缺失或与本仓 BOM 解析结果不一致即失败，升级 BOM 时随之更新。
+  implementation("io.quarkus:quarkus-cache:3.37.0")
+  implementation("io.quarkus:quarkus-core:3.37.0")
+  implementation("io.smallrye.common:smallrye-common-net:2.18.1") // CidrAddress（GraalVM 替换类使用）
+  implementation("jakarta.enterprise:jakarta.enterprise.cdi-api:4.1.0")
   implementation("jakarta.inject:jakarta.inject-api:2.0.1")
 
   // 测试：版本交由 junit-bom 对齐，不写字面量（issue #45）。
@@ -119,3 +125,39 @@ val checkPublishedMetadata = tasks.register("checkPublishedMetadata") {
   }
 }
 tasks.named("check") { dependsOn(checkPublishedMetadata) }
+
+// 防回归（#90 后续）：可消费变体（apiElements / runtimeElements）里的每个外部依赖都必须带版本，
+// 且等于本仓 runtimeClasspath（受 quarkus-bom 约束）的实际解析版本。includeBuild 的消费方直接
+// 读取这些声明，不经过 versionMapping；不一致会让源码引用与发布制品解析出不同版本。
+val checkConsumableVersions = tasks.register("checkConsumableVersions") {
+  description = "核对可消费变体中的外部依赖均带版本且与本仓解析结果一致"
+  group = "verification"
+  val declared = provider {
+    listOf("apiElements", "runtimeElements").flatMap { name ->
+      configurations[name].allDependencies.withType<ExternalModuleDependency>()
+        .map { Triple(name, "${it.group}:${it.name}", it.version.orEmpty()) }
+    }
+  }
+  val resolved = configurations.named("runtimeClasspath").flatMap { c ->
+    c.incoming.resolutionResult.rootComponent.map { root ->
+      root.dependencies.filterIsInstance<org.gradle.api.artifacts.result.ResolvedDependencyResult>()
+        .mapNotNull { it.selected.moduleVersion }
+        .associate { "${it.group}:${it.name}" to it.version }
+    }
+  }
+  doLast {
+    val actual = resolved.get()
+    val problems = declared.get().mapNotNull { (variant, module, version) ->
+      when {
+        version.isBlank() -> "$variant: $module 未写版本"
+        actual[module] == null -> "$variant: $module 未出现在本仓 runtimeClasspath 的直接依赖中"
+        actual[module] != version -> "$variant: $module 声明 $version，本仓解析为 ${actual[module]}"
+        else -> null
+      }
+    }
+    if (problems.isNotEmpty()) {
+      throw GradleException("可消费变体依赖版本问题：\n" + problems.joinToString("\n"))
+    }
+  }
+}
+tasks.named("check") { dependsOn(checkConsumableVersions) }
